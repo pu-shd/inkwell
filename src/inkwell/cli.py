@@ -7,6 +7,7 @@ Exit codes: 0 ok, 1 config/startup error, 2 some files errored or failed the lea
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import datetime as dt
 import hashlib
@@ -16,6 +17,8 @@ import math
 import multiprocessing as mp
 import os
 import re
+import signal
+import subprocess  # noqa: S404 - fixed argv, no shell
 import sys
 import tempfile
 import time
@@ -102,6 +105,9 @@ def _init_worker(
     places: list[PermittedPlace] | None = None,
 ) -> None:
     os.environ.setdefault("OMP_THREAD_LIMIT", "1")  # tesseract: parallelism comes from processes
+    if mp.parent_process() is not None:
+        # Only the main process handles Ctrl-C, so it can save progress before the pool stops.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
     from .engine import Scrubber
     from .recognizers import configure_name_noise
@@ -320,7 +326,12 @@ def plan(cfg: Config, pmap: PseudonymMap) -> list[Job]:
     return jobs
 
 
-def _already_done(cfg: Config, job: Job) -> bool:
+def _already_done(cfg: Config, job: Job, pmap: PseudonymMap) -> bool:
+    """Output written with the original's mtime AND its result recorded in the key. An output whose
+    result never reached the key (the run stopped in between) is redone."""
+    row = pmap.rows.get(job.rel)
+    if row is None or not row.sha_out:
+        return False
     d = cfg.output_dir / PurePosixPath(job.pseudo_stem).parent
     stem = PurePosixPath(job.pseudo_stem).name
     if not d.is_dir():
@@ -770,6 +781,18 @@ def _parser() -> argparse.ArgumentParser:
         help="--suggest-permitted: a place must also appear in the files of at least PCT%% of all "
         "registry people (default 8)",
     )
+    ctl = ap.add_argument_group(
+        "control a running inkwell from another terminal (an interrupted run resumes by running "
+        "the same command again)"
+    )
+    ctl.add_argument("--pause", action="store_true", help="freeze the running inkwell (all its processes)")
+    ctl.add_argument("--resume", action="store_true", help="continue a paused run")
+    ctl.add_argument(
+        "--stop",
+        action="store_true",
+        help="stop the running inkwell cleanly: it saves progress, removes partial files and exits; "
+        "run the same command again to resume",
+    )
     sel = ap.add_argument_group("selection (WHEN: 2019-09-01, 2019-09-01T08:30, or an age: 30d, 12h, 2w)")
     sel.add_argument("--modified-after", metavar="WHEN", help="only files last modified at/after WHEN")
     sel.add_argument("--modified-before", metavar="WHEN", help="only files last modified before WHEN")
@@ -791,7 +814,164 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
+# --- one run at a time; pause, resume, stop --------------------------------------------------
+
+LOCK_NAME = "inkwell.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lock_pid(lock: Path) -> int | None:
+    try:
+        text = lock.read_text().strip()
+    except FileNotFoundError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _acquire_lock(lock: Path) -> None:
+    """Refuse a second run against the same key folder (and so the same key and output)."""
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pid = _lock_pid(lock)
+            if pid is not None and pid != os.getpid() and _pid_alive(pid):
+                raise ConfigError(
+                    f"inkwell is already running (pid {pid}) with this key folder; "
+                    "use --pause/--resume/--stop to control it"
+                ) from None
+            if pid == os.getpid():
+                raise ConfigError("inkwell is already running in this process") from None
+            lock.unlink(missing_ok=True)  # left by a run that crashed or lost power
+            continue
+        with os.fdopen(fd, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        return
+    raise ConfigError(f"could not take the run lock {lock.name}")
+
+
+def _release_lock(lock: Path) -> None:
+    if _lock_pid(lock) == os.getpid():
+        lock.unlink(missing_ok=True)
+
+
+def _process_table() -> list[tuple[int, int]]:
+    """(pid, parent pid) of every process: /proc on Linux (slim images have no ps), else /bin/ps."""
+    proc = Path("/proc")
+    if (proc / "self" / "stat").exists():
+        rows = []
+        for d in proc.iterdir():
+            if d.name.isdigit():
+                with contextlib.suppress(OSError):
+                    stat = (d / "stat").read_text()
+                    rows.append((int(d.name), int(stat.rsplit(")", 1)[1].split()[1])))
+        return rows
+    out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["/bin/ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=True
+    ).stdout
+    return [(int(a), int(b)) for a, b in (line.split() for line in out.splitlines() if line.strip())]
+
+
+def _state(pid: int) -> str:
+    """Process state letter ('T' = stopped), '' if gone."""
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        with contextlib.suppress(OSError, IndexError):
+            return stat.read_text().rsplit(")", 1)[1].split()[0]
+        return ""
+    out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    return out[:1]
+
+
+def _wait_for(pids: list[int], stopped: bool, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        states = [_state(p) for p in pids]
+        if all(st == "" or (st == "T") == stopped for st in states):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _descendants(pid: int) -> list[int]:
+    table = _process_table()
+    found, frontier = [], [pid]
+    while frontier:
+        parent = frontier.pop()
+        kids = [c for c, p in table if p == parent and c not in found]
+        found += kids
+        frontier += kids
+    return found
+
+
+def control(cfg: Config, action: str) -> int:
+    """--pause / --resume / --stop a run that holds the lock in this key folder."""
+    lock = cfg.key_file.parent / LOCK_NAME
+    pid = _lock_pid(lock)
+    if pid is None or not _pid_alive(pid):
+        log.error(
+            "no inkwell run is active for this key folder. To continue an interrupted run, run the "
+            "same command again: finished files are skipped"
+        )
+        return 1
+    procs = [pid, *_descendants(pid)]
+    if action == "pause":
+        for p in reversed(procs):  # workers first, then the main process
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(p, signal.SIGSTOP)
+        if not _wait_for(procs, stopped=True):
+            log.error("run %d did not pause; check it with ps", pid)
+            return 1
+        log.info("paused run %d (%d processes); --resume continues it, --stop ends it", pid, len(procs))
+    elif action == "resume":
+        for p in procs:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(p, signal.SIGCONT)
+        if not _wait_for(procs, stopped=False):
+            log.error("run %d did not resume; check it with ps", pid)
+            return 1
+        log.info("resumed run %d", pid)
+    else:
+        for p in procs:  # a paused run must be awake to stop cleanly
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(p, signal.SIGCONT)
+        os.kill(pid, signal.SIGTERM)
+        log.info("asked run %d to stop; it saves its progress and exits (rerun to resume)", pid)
+    return 0
+
+
+def _sweep_partials(root: Path) -> int:
+    """Delete half-written temp files (never leak-checked) left by a run that was killed."""
+    n = 0
+    if root.is_dir():
+        for p in root.rglob(".part-*"):
+            if p.is_file():
+                p.unlink()
+                n += 1
+    return n
+
+
+def _interrupt(_signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
+    with contextlib.ExitStack() as stack:
+        return _main(argv, stack)
+
+
+def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
     args = _parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
     mode = Mode(redact=not args.no_redact, withhold=not args.no_withhold, dry_run=args.dry_run)
@@ -800,6 +980,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ConfigError("--no-redact with --no-withhold would copy every record unprotected; refused")
         if sum(map(bool, (args.dry_run, args.plan_only, args.audit, args.suggest_permitted))) > 1:
             raise ConfigError("choose one of --dry-run, --plan-only, --audit, --suggest-permitted")
+        controls = [a for a in ("pause", "resume", "stop") if getattr(args, a)]
+        modes = (args.dry_run, args.plan_only, args.audit, args.suggest_permitted, args.force, args.limit)
+        if len(controls) > 1 or (controls and any(modes)):
+            raise ConfigError("--pause, --resume and --stop are used alone, against a running inkwell")
         if args.min_students < 2:
             raise ConfigError("--min-students must be at least 2")
         if not 1 <= args.min_place_share <= 100:
@@ -814,6 +998,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         window.validate()
         cfg = load_config()
+        if controls:
+            return control(cfg, controls[0])
+        if not args.plan_only:
+            lock = cfg.key_file.parent / LOCK_NAME
+            _acquire_lock(lock)
+            stack.callback(_release_lock, lock)
+            previous = signal.signal(signal.SIGTERM, _interrupt)  # --stop / kill: stop cleanly
+            stack.callback(signal.signal, signal.SIGTERM, previous)
         report_file = None
         if args.dry_run:
             report_file = (
@@ -905,7 +1097,12 @@ def main(argv: list[str] | None = None) -> int:
             warn_file.write_text("\n".join(warnings))
         else:
             warn_file.unlink(missing_ok=True)
-        todo = jobs if args.force else [j for j in jobs if not _already_done(cfg, j)]
+        swept = _sweep_partials(cfg.output_dir)
+        if swept:
+            log.warning("removed %d half-written file(s) left by an interrupted run", swept)
+        todo = jobs if args.force else [j for j in jobs if not _already_done(cfg, j, pmap)]
+        if len(todo) < len(jobs):
+            log.info("resuming: %d of %d selected files already done", len(jobs) - len(todo), len(jobs))
     log.info("%d files selected, %d to process, %d workers", len(jobs), len(todo), cfg.workers)
 
     statuses: Counter[str] = Counter()
@@ -924,6 +1121,8 @@ def main(argv: list[str] | None = None) -> int:
         if new_report:
             w.writerow(REPORT_FIELDS)
     ctx = mp.get_context("spawn")
+    done = 0
+    interrupted = False
     try:
         with ctx.Pool(
             cfg.workers,
@@ -932,6 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
             maxtasksperchild=200,
         ) as pool:
             for i, r in enumerate(pool.imap_unordered(_run_job, todo, chunksize=1), 1):
+                done = i
                 statuses[r.status] += 1
                 entities.update(r.entities)
                 notes = ";".join(r.notes)
@@ -972,8 +1172,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if not args.dry_run and i % 50 == 0:
                     pmap.save()
+    except KeyboardInterrupt:
+        interrupted = True  # leaving the with-block terminated the workers
     finally:
         rf.close()  # type: ignore[attr-defined]
+    if interrupted:
+        if args.dry_run:
+            log.warning(
+                "interrupted after %d of %d files; the dry-run report is partial (%s). A dry run "
+                "can't be resumed: run it again to start over",
+                done,
+                len(todo),
+                report_file,
+            )
+        else:
+            pmap.save()  # every result received so far
+            _sweep_partials(cfg.output_dir)
+            log.warning(
+                "interrupted after %d of %d files; progress saved. Run the same command again to "
+                "resume: finished files are skipped",
+                done,
+                len(todo),
+            )
+        return 130
 
     summary = {
         "mode": {**mode.as_dict(), "dry_run": mode.dry_run},
@@ -981,6 +1202,7 @@ def main(argv: list[str] | None = None) -> int:
         "excluded_by_window": excluded,
         "selected": len(jobs),
         "processed": len(todo),
+        "already_done": len(jobs) - len(todo),
         "statuses": dict(statuses),
         "entities": dict(entities),
         "permitted_names": len(permitted),

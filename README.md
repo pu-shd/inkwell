@@ -94,6 +94,7 @@ scripts/run.sh --plan-only        # fast: counts by type for the selection, writ
 scripts/run.sh --dry-run          # full simulation, writes only a private report (see below)
 scripts/run.sh --limit 50         # pilot
 scripts/run.sh                    # full run; re-runnable, skips finished files (--force to redo)
+scripts/run.sh --pause            # from another terminal: pause / --resume / --stop (see below)
 scripts/run.sh --audit            # after a recognizer fix: re-check existing outputs, delete any
                                   # that fail (plus images), then run again to redo just those
 scripts/docker-run.sh             # same, in a network-isolated container
@@ -182,6 +183,22 @@ CSV, `dryrun-<time>.csv` beside the key file (or `--report PATH`), mode 600, wit
 `original_path, pseudonym_path, pseudonym_is_new, kind, would_status, category, entities,
 notes, modified, created`. It lists **original paths** (which contain names), so it is refused
 inside the input or output folder. Values are never written. It takes as long as a real run.
+
+### Pausing, stopping and resuming
+
+| To | Do |
+|---|---|
+| pause for a while (keeps everything in memory) | `scripts/run.sh --pause` from another terminal, or Ctrl-Z in the run's terminal |
+| continue a paused run | `scripts/run.sh --resume` (or `fg` after Ctrl-Z) |
+| stop (e.g. before a restart) | Ctrl-C, or `scripts/run.sh --stop` from another terminal |
+| continue after a stop, crash or power loss | run the same command again |
+
+A stopped run saves every finished file's key data, removes half-written files and exits with
+code `130`. A rerun skips files whose output exists **and** whose result is in the key, so a file
+that was written but not yet recorded is simply redone. Only one run at a time may use a key
+folder (`inkwell.lock` there; a lock left by a crash is taken over). A dry run can be paused but not
+resumed after a stop: its report only means something as one complete pass. Sleep is safe: work
+continues on wake (`scripts/run.sh` keeps the Mac from idle-sleeping while it runs).
 
 ### Redaction and withholding switches
 

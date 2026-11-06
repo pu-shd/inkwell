@@ -14,6 +14,9 @@ each release is tagged `vX.Y.Z` and published on the GitHub Releases page.
   `--suggest-permitted` also drafts a places list from places that reach a large share of all
   record subjects (`--min-place-share`, default 8%), leaving out form labels, abbreviations and
   places mostly seen as someone's birthplace or address.
+- Pause, stop and resume: `--pause`, `--resume` and `--stop` control a running inkwell; Ctrl-C
+  or `--stop` saves progress and a rerun continues where it stopped. One run per key folder
+  (`inkwell.lock`); half-written files from a killed run are removed.
 - Release packaging: wheel and sdist on GitHub Releases with SHA-256 checksums and build
   provenance, a container image on GHCR, `inkwell --version`.
 
