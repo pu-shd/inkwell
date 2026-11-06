@@ -7,24 +7,46 @@ Exit codes: 0 ok, 1 config/startup error, 2 some files errored or failed the lea
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import re
+import signal
+import subprocess  # noqa: S404 - fixed argv, no shell
 import sys
 import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
+from . import __version__
 from .config import Config, ConfigError, load_config
+from .permitted import (
+    PLACE_COLUMNS,
+    PermittedNames,
+    PermittedPerson,
+    PermittedPlace,
+    candidate_name,
+    candidate_place,
+    load_permitted,
+    load_places,
+    place_key,
+    variant_key,
+    write_people,
+)
 from .pseudonym import PseudonymMap
 from .registry import Registry
+
+if TYPE_CHECKING:
+    from presidio_analyzer import RecognizerResult
 
 log = logging.getLogger("inkwell")
 
@@ -75,8 +97,17 @@ class JobResult:
 _W: dict[str, object] = {}
 
 
-def _init_worker(cfg: Config, students: list[tuple[str, list[str]]], mode: Mode) -> None:
+def _init_worker(
+    cfg: Config,
+    students: list[tuple[str, list[str]]],
+    mode: Mode,
+    permitted: list[PermittedPerson] | None = None,
+    places: list[PermittedPlace] | None = None,
+) -> None:
     os.environ.setdefault("OMP_THREAD_LIMIT", "1")  # tesseract: parallelism comes from processes
+    if mp.parent_process() is not None:
+        # Only the main process handles Ctrl-C, so it can save progress before the pool stops.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
     from .engine import Scrubber
     from .recognizers import configure_name_noise
@@ -92,6 +123,10 @@ def _init_worker(cfg: Config, students: list[tuple[str, list[str]]], mode: Mode)
         students=students,
         extra_id_labels=cfg.extra_id_labels,
     )
+    if permitted or places:
+        _W["scrubber"].set_permitted(  # type: ignore[attr-defined]
+            PermittedNames(permitted or [], cfg.permitted_contacts, places or [])
+        )
 
 
 def _run_job(job: Job) -> JobResult:
@@ -291,7 +326,12 @@ def plan(cfg: Config, pmap: PseudonymMap) -> list[Job]:
     return jobs
 
 
-def _already_done(cfg: Config, job: Job) -> bool:
+def _already_done(cfg: Config, job: Job, pmap: PseudonymMap) -> bool:
+    """Output written with the original's mtime AND its result recorded in the key. An output whose
+    result never reached the key (the run stopped in between) is redone."""
+    row = pmap.rows.get(job.rel)
+    if row is None or not row.sha_out:
+        return False
     d = cfg.output_dir / PurePosixPath(job.pseudo_stem).parent
     stem = PurePosixPath(job.pseudo_stem).name
     if not d.is_dir():
@@ -356,6 +396,215 @@ def _contains_image(name: str, data: bytes, depth: int = 0) -> bool:
     return False
 
 
+def _load_permitted(
+    cfg: Config, students: list[tuple[str, list[str]]]
+) -> tuple[list[PermittedPerson], list[PermittedPerson]]:
+    """Permitted people minus anyone who is a registry person (the registry always wins)."""
+    if cfg.permitted_names_file is None:
+        return [], []
+    from .recognizers import KnownNameRecognizer
+
+    people = load_permitted(cfg.permitted_names_file)
+    return PermittedNames.without_students(people, KnownNameRecognizer(students))
+
+
+Found = tuple[tuple[str, ...], list[tuple[str, tuple[str, ...]]], list[tuple[str, bool]]]
+_PERSONAL_FIELDS = frozenset({"PLACE_OF_BIRTH", "STREET_ADDRESS"})
+
+
+def _suggest_job(
+    job: Job,
+) -> tuple[tuple[str, ...], list[tuple[str, tuple[str, ...]]], list[tuple[str, bool]], bool]:
+    """(owners, names, places, ok). A file that can't be read is skipped and counted, never fatal."""
+    try:
+        return (*_suggest_names(job), True)
+    except Exception:  # noqa: BLE001 - one bad file must not end the pass
+        return job.owner_ids, [], [], False
+
+
+def _suggest_names(job: Job) -> Found:
+    """Full names and place names in one document: email display names (with their addresses)
+    and PERSON/LOCATION entities in its existing text. No OCR, so scanned pages are not
+    considered. A place is flagged personal when it sits in a labeled place-of-birth or address
+    field in this document."""
+    from email import policy
+    from email.parser import BytesParser
+    from email.utils import getaddresses
+
+    from .engine import Scrubber
+    from .leakcheck import extract_text
+    from .sniff import sniff
+
+    sc: Scrubber = _W["scrubber"]  # type: ignore[assignment]
+    name = PurePosixPath(job.rel).name
+    data = Path(job.src).read_bytes()
+    kind = sniff(name, data)
+    found: dict[frozenset[str], tuple[str, set[str]]] = {}
+
+    cfg: Config = _W["cfg"]  # type: ignore[assignment]
+    noise = frozenset(w.lower() for w in cfg.extra_name_noise)
+
+    def add(raw: str, email: str = "") -> None:
+        raw = re.sub(r"<[^>]*>?|\S+@\S+", " ", raw)  # header text: drop addresses
+        surface = candidate_name(raw.strip(" \"'"), noise)
+        if surface is None or sc.known.is_registry_full_name(surface):
+            return
+        key = variant_key(surface)
+        entry = found.setdefault(key, (surface, set()))
+        if email:
+            entry[1].add(email.lower())
+
+    if kind in ("drop", "unsupported", "image"):
+        return job.owner_ids, [], []
+    if kind == "eml":
+        msg = BytesParser(policy=policy.compat32).parsebytes(data)
+        for part in msg.walk():
+            for h in ("from", "to", "cc", "reply-to", "sender"):
+                for disp, addr in getaddresses([str(v) for v in part.get_all(h, []) or []]):
+                    if disp:
+                        add(disp, addr)
+    try:
+        text = extract_text(name, data)[:300_000]
+    except Exception:  # noqa: BLE001 - a suggestion pass must not stop on one bad file
+        text = ""
+    results = sc.analyze(text)
+    known = [(r.start, r.end) for r in results if r.entity_type == "KNOWN_STUDENT_NAME"]
+    people_spans = known + [(r.start, r.end) for r in results if r.entity_type == "PERSON"]
+    personal = [
+        (r.start, r.end)
+        for r in results
+        if r.entity_type in _PERSONAL_FIELDS
+        and (r.recognition_metadata or {}).get("recognizer_name") == "LabeledFieldRecognizer"
+    ]
+    places: dict[str, tuple[str, bool]] = {}
+
+    def hits(r: RecognizerResult, spans: list[tuple[int, int]]) -> bool:
+        return any(s < r.end and e > r.start for s, e in spans)
+
+    for r in results:
+        if r.entity_type == "PERSON" and not hits(r, known):
+            add(text[r.start : r.end])
+        elif r.entity_type == "LOCATION" and not hits(r, people_spans):
+            surface = candidate_place(text[r.start : r.end], noise)
+            if surface is not None:
+                prev = places.get(place_key(surface))
+                places[place_key(surface)] = (
+                    prev[0] if prev else surface,
+                    hits(r, personal) or bool(prev and prev[1]),
+                )
+    return (
+        job.owner_ids,
+        [(surface, tuple(sorted(emails))) for surface, emails in found.values()],
+        list(places.values()),
+    )
+
+
+def suggest_permitted(
+    cfg: Config,
+    students: list[tuple[str, list[str]]],
+    jobs: list[Job],
+    min_people: int,
+    min_place_share: float = 8.0,
+) -> int:
+    """Write permitted-suggestions-<time>.csv (permitted-names format plus evidence columns)
+    beside the key file. Nothing is applied automatically; nothing touches the output."""
+    agg: dict[frozenset[str], dict[str, object]] = {}
+    pagg: dict[str, dict[str, object]] = {}
+    skipped = 0
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        cfg.workers, initializer=_init_worker, initargs=(cfg, students, Mode(dry_run=True))
+    ) as pool:
+        for owners, names, found_places, ok in pool.imap_unordered(_suggest_job, jobs, chunksize=4):
+            skipped += not ok
+            for surface, is_personal in found_places:
+                pe = pagg.setdefault(
+                    place_key(surface), {"surfaces": Counter(), "people": set(), "personal": set(), "docs": 0}
+                )
+                pe["surfaces"][surface] += 1  # type: ignore[index]
+                pe["people"] |= set(owners)  # type: ignore[operator]
+                if is_personal:
+                    pe["personal"] |= set(owners)  # type: ignore[operator]
+                pe["docs"] += 1  # type: ignore[operator]
+            for surface, addrs in names:
+                e = agg.setdefault(
+                    variant_key(surface),
+                    {"surfaces": Counter(), "people": set(), "docs": 0, "emails": Counter()},
+                )
+                e["surfaces"][surface] += 1  # type: ignore[index]
+                e["people"] |= set(owners)  # type: ignore[operator]
+                e["docs"] += 1  # type: ignore[operator]
+                e["emails"].update(addrs)  # type: ignore[attr-defined]
+    rows = []
+    for e in agg.values():
+        people: set[str] = e["people"]  # type: ignore[assignment]
+        if len(people) < min_people:
+            continue
+        surfaces: Counter[str] = e["surfaces"]  # type: ignore[assignment]
+        plain = [s for s, _ in surfaces.most_common() if "," not in s] or [surfaces.most_common(1)[0][0]]
+        seen: Counter[str] = e["emails"]  # type: ignore[assignment]
+        rows.append(
+            [
+                plain[0],
+                "",
+                ";".join(m for m, _ in seen.most_common(3)),
+                "",
+                str(len(people)),
+                str(e["docs"]),
+            ]
+        )
+    rows.sort(key=lambda r: (-int(r[4]), -int(r[5]), r[0]))
+    stamp = f"{dt.datetime.now():%Y%m%d-%H%M%S}"
+    out = cfg.key_file.parent / f"permitted-suggestions-{stamp}.csv"
+    write_people(out, rows, extra_header=("evidence_students", "evidence_documents"))
+    log.info(
+        "suggested %d permitted name(s) seen in the files of >= %d people; review, then point "
+        "INKWELL_PERMITTED_NAMES_FILE at it: %s",
+        len(rows),
+        min_people,
+        out,
+    )
+    # Institutional places reach a large share of everyone; hometowns and countries of origin recur
+    # among a few people, so places need both thresholds.
+    min_place = max(min_people, math.ceil(min_place_share / 100 * len(students)))
+    place_rows, personal_out = [], 0
+    for pe in pagg.values():
+        ppl: set[str] = pe["people"]  # type: ignore[assignment]
+        pers: set[str] = pe["personal"]  # type: ignore[assignment]
+        if len(ppl) < min_place:
+            continue
+        if 2 * len(pers) >= len(ppl):  # mostly someone's birthplace or address: never suggested
+            personal_out += 1
+            continue
+        psurfaces: Counter[str] = pe["surfaces"]  # type: ignore[assignment]
+        place_rows.append(
+            [psurfaces.most_common(1)[0][0], "", str(len(ppl)), str(pe["docs"]), str(len(pers))]
+        )
+    place_rows.sort(key=lambda r: (-int(r[2]), -int(r[3]), r[0]))
+    pout = cfg.key_file.parent / f"permitted-places-suggestions-{stamp}.csv"
+    write_people(
+        pout,
+        place_rows,
+        extra_header=("evidence_students", "evidence_documents", "evidence_personal_students"),
+        columns=PLACE_COLUMNS,
+    )
+    log.info(
+        "suggested %d permitted place(s) seen in the files of >= %d people (%g%% of %d; %d more left "
+        "out: mostly in place-of-birth or address fields); review, then point "
+        "INKWELL_PERMITTED_PLACES_FILE at it: %s",
+        len(place_rows),
+        min_place,
+        min_place_share,
+        len(students),
+        personal_out,
+        pout,
+    )
+    if skipped:
+        log.warning("%d file(s) could not be read and were skipped; suggestions may be incomplete", skipped)
+        return 2
+    return 0
+
+
 def audit(cfg: Config, registry: Registry) -> int:
     """Fail closed on outputs produced by older code: anything that no longer passes the
     current leak check, and every image (no text layer to check), is deleted."""
@@ -402,7 +651,10 @@ def _preflight(cfg: Config) -> None:
     if cfg.tesseract_lang not in pytesseract.get_languages(config=""):
         raise ConfigError(f"tesseract language data missing: {cfg.tesseract_lang}")
     if not spacy.util.is_package(cfg.spacy_model):
-        raise ConfigError(f"spaCy model not installed: {cfg.spacy_model}")
+        raise ConfigError(
+            f"spaCy model not installed: {cfg.spacy_model} (it ships as a dependency of inkwell; "
+            "reinstall inkwell, or install the model from the spacy-models releases)"
+        )
 
 
 WARNINGS = {
@@ -482,6 +734,7 @@ def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="inkwell", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    ap.add_argument("--version", action="version", version=f"inkwell {__version__}")
     run = ap.add_argument_group("run modes")
     run.add_argument(
         "--dry-run",
@@ -506,6 +759,40 @@ def _parser() -> argparse.ArgumentParser:
         help="re-run the leak check over existing outputs; delete failures and images so "
         "the next run reprocesses them (use after a recognizer fix)",
     )
+    run.add_argument(
+        "--suggest-permitted",
+        action="store_true",
+        help="draft a permitted-names list from full names that recur across many people's files "
+        "(email display names and existing text, no OCR); written beside the key for review",
+    )
+    run.add_argument(
+        "--min-students",
+        type=int,
+        default=3,
+        metavar="N",
+        help="--suggest-permitted: a name must appear in the files of at least N different "
+        "registry people (default 3)",
+    )
+    run.add_argument(
+        "--min-place-share",
+        type=float,
+        default=8.0,
+        metavar="PCT",
+        help="--suggest-permitted: a place must also appear in the files of at least PCT%% of all "
+        "registry people (default 8)",
+    )
+    ctl = ap.add_argument_group(
+        "control a running inkwell from another terminal (an interrupted run resumes by running "
+        "the same command again)"
+    )
+    ctl.add_argument("--pause", action="store_true", help="freeze the running inkwell (all its processes)")
+    ctl.add_argument("--resume", action="store_true", help="continue a paused run")
+    ctl.add_argument(
+        "--stop",
+        action="store_true",
+        help="stop the running inkwell cleanly: it saves progress, removes partial files and exits; "
+        "run the same command again to resume",
+    )
     sel = ap.add_argument_group("selection (WHEN: 2019-09-01, 2019-09-01T08:30, or an age: 30d, 12h, 2w)")
     sel.add_argument("--modified-after", metavar="WHEN", help="only files last modified at/after WHEN")
     sel.add_argument("--modified-before", metavar="WHEN", help="only files last modified before WHEN")
@@ -527,15 +814,180 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
+# --- one run at a time; pause, resume, stop --------------------------------------------------
+
+LOCK_NAME = "inkwell.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lock_pid(lock: Path) -> int | None:
+    try:
+        text = lock.read_text().strip()
+    except FileNotFoundError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _acquire_lock(lock: Path) -> None:
+    """Refuse a second run against the same key folder (and so the same key and output)."""
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pid = _lock_pid(lock)
+            if pid is not None and pid != os.getpid() and _pid_alive(pid):
+                raise ConfigError(
+                    f"inkwell is already running (pid {pid}) with this key folder; "
+                    "use --pause/--resume/--stop to control it"
+                ) from None
+            if pid == os.getpid():
+                raise ConfigError("inkwell is already running in this process") from None
+            lock.unlink(missing_ok=True)  # left by a run that crashed or lost power
+            continue
+        with os.fdopen(fd, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        return
+    raise ConfigError(f"could not take the run lock {lock.name}")
+
+
+def _release_lock(lock: Path) -> None:
+    if _lock_pid(lock) == os.getpid():
+        lock.unlink(missing_ok=True)
+
+
+def _process_table() -> list[tuple[int, int]]:
+    """(pid, parent pid) of every process: /proc on Linux (slim images have no ps), else /bin/ps."""
+    proc = Path("/proc")
+    if (proc / "self" / "stat").exists():
+        rows = []
+        for d in proc.iterdir():
+            if d.name.isdigit():
+                with contextlib.suppress(OSError):
+                    stat = (d / "stat").read_text()
+                    rows.append((int(d.name), int(stat.rsplit(")", 1)[1].split()[1])))
+        return rows
+    out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["/bin/ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=True
+    ).stdout
+    return [(int(a), int(b)) for a, b in (line.split() for line in out.splitlines() if line.strip())]
+
+
+def _state(pid: int) -> str:
+    """Process state letter ('T' = stopped), '' if gone."""
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        with contextlib.suppress(OSError, IndexError):
+            return stat.read_text().rsplit(")", 1)[1].split()[0]
+        return ""
+    out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    return out[:1]
+
+
+def _wait_for(pids: list[int], stopped: bool, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        states = [_state(p) for p in pids]
+        if all(st == "" or (st == "T") == stopped for st in states):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _descendants(pid: int) -> list[int]:
+    table = _process_table()
+    found, frontier = [], [pid]
+    while frontier:
+        parent = frontier.pop()
+        kids = [c for c, p in table if p == parent and c not in found]
+        found += kids
+        frontier += kids
+    return found
+
+
+def control(cfg: Config, action: str) -> int:
+    """--pause / --resume / --stop a run that holds the lock in this key folder."""
+    lock = cfg.key_file.parent / LOCK_NAME
+    pid = _lock_pid(lock)
+    if pid is None or not _pid_alive(pid):
+        log.error(
+            "no inkwell run is active for this key folder. To continue an interrupted run, run the "
+            "same command again: finished files are skipped"
+        )
+        return 1
+    procs = [pid, *_descendants(pid)]
+    if action == "pause":
+        for p in reversed(procs):  # workers first, then the main process
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(p, signal.SIGSTOP)
+        if not _wait_for(procs, stopped=True):
+            log.error("run %d did not pause; check it with ps", pid)
+            return 1
+        log.info("paused run %d (%d processes); --resume continues it, --stop ends it", pid, len(procs))
+    elif action == "resume":
+        for p in procs:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(p, signal.SIGCONT)
+        if not _wait_for(procs, stopped=False):
+            log.error("run %d did not resume; check it with ps", pid)
+            return 1
+        log.info("resumed run %d", pid)
+    else:
+        for p in procs:  # a paused run must be awake to stop cleanly
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(p, signal.SIGCONT)
+        os.kill(pid, signal.SIGTERM)
+        log.info("asked run %d to stop; it saves its progress and exits (rerun to resume)", pid)
+    return 0
+
+
+def _sweep_partials(root: Path) -> int:
+    """Delete half-written temp files (never leak-checked) left by a run that was killed."""
+    n = 0
+    if root.is_dir():
+        for p in root.rglob(".part-*"):
+            if p.is_file():
+                p.unlink()
+                n += 1
+    return n
+
+
+def _interrupt(_signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
+    with contextlib.ExitStack() as stack:
+        return _main(argv, stack)
+
+
+def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
     args = _parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
     mode = Mode(redact=not args.no_redact, withhold=not args.no_withhold, dry_run=args.dry_run)
     try:
         if not mode.redact and not mode.withhold:
             raise ConfigError("--no-redact with --no-withhold would copy every record unprotected; refused")
-        if sum(map(bool, (args.dry_run, args.plan_only, args.audit))) > 1:
-            raise ConfigError("choose one of --dry-run, --plan-only, --audit")
+        if sum(map(bool, (args.dry_run, args.plan_only, args.audit, args.suggest_permitted))) > 1:
+            raise ConfigError("choose one of --dry-run, --plan-only, --audit, --suggest-permitted")
+        controls = [a for a in ("pause", "resume", "stop") if getattr(args, a)]
+        modes = (args.dry_run, args.plan_only, args.audit, args.suggest_permitted, args.force, args.limit)
+        if len(controls) > 1 or (controls and any(modes)):
+            raise ConfigError("--pause, --resume and --stop are used alone, against a running inkwell")
+        if args.min_students < 2:
+            raise ConfigError("--min-students must be at least 2")
+        if not 1 <= args.min_place_share <= 100:
+            raise ConfigError("--min-place-share must be between 1 and 100")
         if args.report and not args.dry_run:
             raise ConfigError("--report applies to --dry-run")
         window = Window(
@@ -546,6 +998,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         window.validate()
         cfg = load_config()
+        if controls:
+            return control(cfg, controls[0])
+        if not args.plan_only:
+            lock = cfg.key_file.parent / LOCK_NAME
+            _acquire_lock(lock)
+            stack.callback(_release_lock, lock)
+            previous = signal.signal(signal.SIGTERM, _interrupt)  # --stop / kill: stop cleanly
+            stack.callback(signal.signal, signal.SIGTERM, previous)
         report_file = None
         if args.dry_run:
             report_file = (
@@ -571,9 +1031,12 @@ def main(argv: list[str] | None = None) -> int:
         known_before = set(pmap.rows)
         if args.audit:
             return audit(cfg, registry)
+        students = student_table(cfg, registry)
+        permitted, conflicts = _load_permitted(cfg, students)
+        places = load_places(cfg.permitted_places_file) if cfg.permitted_places_file else []
         all_jobs = plan(cfg, pmap)
         jobs = [j for j in all_jobs if window.matches(j)]
-        if not (args.dry_run or args.plan_only):
+        if not (args.dry_run or args.plan_only or args.suggest_permitted):
             _check_mode(cfg, mode, args, window)
     except (ConfigError, ValueError) as exc:
         log.error("configuration error: %s", exc)
@@ -590,6 +1053,22 @@ def main(argv: list[str] | None = None) -> int:
     warnings = _mode_warnings(mode)
     for wtext in warnings:
         log.warning("%s", wtext.replace("\n", " "))
+
+    if conflicts:
+        log.warning(
+            "%d permitted name(s) are also registry people and will stay redacted%s",
+            len(conflicts),
+            "" if args.dry_run or args.plan_only else "; listed in permitted-conflicts.csv beside the key",
+        )
+    if not (args.dry_run or args.plan_only or args.suggest_permitted):
+        cfile = cfg.key_file.parent / "permitted-conflicts.csv"
+        if conflicts:
+            write_people(cfile, ([p.name, ";".join(p.aliases), "", ""] for p in conflicts))
+        else:
+            cfile.unlink(missing_ok=True)
+
+    if args.suggest_permitted:
+        return suggest_permitted(cfg, students, jobs, args.min_students, args.min_place_share)
 
     if args.plan_only:
         from .sniff import sniff
@@ -618,7 +1097,12 @@ def main(argv: list[str] | None = None) -> int:
             warn_file.write_text("\n".join(warnings))
         else:
             warn_file.unlink(missing_ok=True)
-        todo = jobs if args.force else [j for j in jobs if not _already_done(cfg, j)]
+        swept = _sweep_partials(cfg.output_dir)
+        if swept:
+            log.warning("removed %d half-written file(s) left by an interrupted run", swept)
+        todo = jobs if args.force else [j for j in jobs if not _already_done(cfg, j, pmap)]
+        if len(todo) < len(jobs):
+            log.info("resuming: %d of %d selected files already done", len(jobs) - len(todo), len(jobs))
     log.info("%d files selected, %d to process, %d workers", len(jobs), len(todo), cfg.workers)
 
     statuses: Counter[str] = Counter()
@@ -637,12 +1121,17 @@ def main(argv: list[str] | None = None) -> int:
         if new_report:
             w.writerow(REPORT_FIELDS)
     ctx = mp.get_context("spawn")
-    students = student_table(cfg, registry)
+    done = 0
+    interrupted = False
     try:
         with ctx.Pool(
-            cfg.workers, initializer=_init_worker, initargs=(cfg, students, mode), maxtasksperchild=200
+            cfg.workers,
+            initializer=_init_worker,
+            initargs=(cfg, students, mode, permitted, places),
+            maxtasksperchild=200,
         ) as pool:
             for i, r in enumerate(pool.imap_unordered(_run_job, todo, chunksize=1), 1):
+                done = i
                 statuses[r.status] += 1
                 entities.update(r.entities)
                 notes = ";".join(r.notes)
@@ -683,8 +1172,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if not args.dry_run and i % 50 == 0:
                     pmap.save()
+    except KeyboardInterrupt:
+        interrupted = True  # leaving the with-block terminated the workers
     finally:
         rf.close()  # type: ignore[attr-defined]
+    if interrupted:
+        if args.dry_run:
+            log.warning(
+                "interrupted after %d of %d files; the dry-run report is partial (%s). A dry run "
+                "can't be resumed: run it again to start over",
+                done,
+                len(todo),
+                report_file,
+            )
+        else:
+            pmap.save()  # every result received so far
+            _sweep_partials(cfg.output_dir)
+            log.warning(
+                "interrupted after %d of %d files; progress saved. Run the same command again to "
+                "resume: finished files are skipped",
+                done,
+                len(todo),
+            )
+        return 130
 
     summary = {
         "mode": {**mode.as_dict(), "dry_run": mode.dry_run},
@@ -692,8 +1202,12 @@ def main(argv: list[str] | None = None) -> int:
         "excluded_by_window": excluded,
         "selected": len(jobs),
         "processed": len(todo),
+        "already_done": len(jobs) - len(todo),
         "statuses": dict(statuses),
         "entities": dict(entities),
+        "permitted_names": len(permitted),
+        "permitted_conflicts": len(conflicts),
+        "permitted_places": len(places),
     }
     if args.dry_run:
         log.info("DRY RUN summary: %s", json.dumps(summary))

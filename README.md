@@ -69,6 +69,22 @@ Reassociating: find the person in `registry.csv` → `student_id` → output fol
 `*/S-…/` plus every `key.csv` row whose `student_ids` or `mentions` contains it.
 Destroying the key directory makes the output non-reidentifiable by these files.
 
+## Install
+
+From a release (needs Python 3.12 and Tesseract; the spaCy model, about 0.6 GB, comes with it):
+
+```zsh
+brew install tesseract uv
+uv tool install https://github.com/pu-shd/inkwell/releases/download/vX.Y.Z/inkwell-X.Y.Z-py3-none-any.whl
+inkwell --version
+```
+
+Each release also has the sdist, `SHA256SUMS` and build-provenance attestations
+(`gh attestation verify <file> -R pu-shd/inkwell`), and a container image
+`ghcr.io/pu-shd/inkwell:vX.Y.Z` (Tesseract included; run it network-isolated, as
+`scripts/docker-run.sh` does). Configuration is read from `INKWELL_*` environment variables
+(see `example.env`). From a clone, use `scripts/setup.sh` instead.
+
 ## Usage
 
 ```zsh
@@ -78,6 +94,7 @@ scripts/run.sh --plan-only        # fast: counts by type for the selection, writ
 scripts/run.sh --dry-run          # full simulation, writes only a private report (see below)
 scripts/run.sh --limit 50         # pilot
 scripts/run.sh                    # full run; re-runnable, skips finished files (--force to redo)
+scripts/run.sh --pause            # from another terminal: pause / --resume / --stop (see below)
 scripts/run.sh --audit            # after a recognizer fix: re-check existing outputs, delete any
                                   # that fail (plus images), then run again to redo just those
 scripts/docker-run.sh             # same, in a network-isolated container
@@ -91,6 +108,64 @@ scripts/test.sh                   # lint + mypy + tests in Docker (CI); --local 
 | `INKWELL_GROUP_DIR_REGEX` | top-level grouping folders; one capturing group = year label | `^Cohort (\d{4}-\d{2})$` |
 | `INKWELL_EXTRA_ID_LABELS` | extra form labels that precede an ID number | `XUID,Member ID` |
 | `INKWELL_EXTRA_NAME_NOISE` | words in folder names that are not names (codes, departments) | `msc,ba` |
+
+### Permitted names
+
+Names of people who may stay visible (staff, officials, signatories…) go in a CSV beside the
+key file, set with `INKWELL_PERMITTED_NAMES_FILE`:
+
+```csv
+name,aliases,emails,phones
+Ada Lovelace,"Augusta Ada King;A. Lovelace",ada@example.org,(555) 555-0100
+```
+
+* Full names only, matched in either order and ignoring case and titles (`Dr. Ada Lovelace`,
+  `Lovelace, Ada`). A lone surname or first name stays redacted.
+* Record subjects always win: an entry that is also a registry person is dropped at startup
+  (counted as `permitted_conflicts` in the summary, listed in `permitted-conflicts.csv` beside the
+  key), and any span overlapping a known subject stays redacted.
+* Only names are kept. With `INKWELL_PERMITTED_CONTACTS=true`, the listed emails and phone
+  numbers of permitted people are kept too; nothing else is.
+* Kept names are counted as `PERMITTED_NAME` (and `PERMITTED_CONTACT`) in the report.
+* `--suggest-permitted [--min-students N]` drafts a list from full names that appear in the
+  files of at least N different registry people (default 3), from email display names and the
+  text already in each document (no OCR). It writes `permitted-suggestions-<time>.csv` beside
+  the key, in the same format plus evidence columns, and applies nothing. Review it, delete rows,
+  then point `INKWELL_PERMITTED_NAMES_FILE` at it.
+* Suggestions are only name-shaped text: at least two full words, no form labels, degrees,
+  markup, garbled encodings, initials-only forms, salutations or citations. Variants differing only
+  in initials share one row. Detection is still imprecise (streets, buildings, product names and
+  OCR fragments can get through); put site-specific words in `INKWELL_EXTRA_NAME_NOISE`, and
+  always review the list.
+
+### Permitted places
+
+The place equivalent of permitted names: institutional place names (campus, buildings, the
+institution's town) that may stay visible, in a CSV set with `INKWELL_PERMITTED_PLACES_FILE`:
+
+```csv
+place,aliases
+Springfield,"Springfield, Ohio;Springfield OH"
+Wexford Hall,
+```
+
+* Matched against whole `LOCATION` results (case, punctuation and a leading "the" ignored), or
+  against comma/line-separated parts of one. Single words are allowed. Digits are not, so
+  street addresses and postal codes always stay redacted.
+* Only `LOCATION` results are unmasked. A place in a labeled field (place of birth, home or
+  campus address), a street-address match, or a span overlapping a record subject's name stays
+  redacted. Counted as `PERMITTED_PLACE`; the summary has `permitted_places`.
+* Trade-off: a permitted town is also visible where it is part of someone's own address outside
+  a labeled field.
+* `--suggest-permitted` also writes `permitted-places-suggestions-<time>.csv`. Recurrence alone
+  doesn't separate the institution's places from hometowns and countries of origin, which also
+  recur across people, so a place must appear in the files of at least `--min-place-share`
+  percent of all registry people (default 8, and never fewer than `--min-students`). On one
+  reviewed corpus every rejected place was below that share and the institution's places above
+  it. Form labels ("Home City"), dotted abbreviations, other institutions and subject words are
+  never suggested. A place seen in the labeled place-of-birth or address fields of half or more
+  of its people is left out (counted in the log); `evidence_personal_students` counts the rest.
+  Review the list as you would the names list.
 
 ### Selecting by date
 
@@ -109,6 +184,22 @@ CSV, `dryrun-<time>.csv` beside the key file (or `--report PATH`), mode 600, wit
 notes, modified, created`. It lists **original paths** (which contain names), so it is refused
 inside the input or output folder. Values are never written. It takes as long as a real run.
 
+### Pausing, stopping and resuming
+
+| To | Do |
+|---|---|
+| pause for a while (keeps everything in memory) | `scripts/run.sh --pause` from another terminal, or Ctrl-Z in the run's terminal |
+| continue a paused run | `scripts/run.sh --resume` (or `fg` after Ctrl-Z) |
+| stop (e.g. before a restart) | Ctrl-C, or `scripts/run.sh --stop` from another terminal |
+| continue after a stop, crash or power loss | run the same command again |
+
+A stopped run saves every finished file's key data, removes half-written files and exits with
+code `130`. A rerun skips files whose output exists **and** whose result is in the key, so a file
+that was written but not yet recorded is simply redone. Only one run at a time may use a key
+folder (`inkwell.lock` there; a lock left by a crash is taken over). A dry run can be paused but not
+resumed after a stop: its report only means something as one complete pass. Sleep is safe: work
+continues on wake (`scripts/run.sh` keeps the Mac from idle-sleeping while it runs).
+
 ### Redaction and withholding switches
 
 | Flags | Withheld records | Everything else | Warning |
@@ -125,12 +216,20 @@ output requires `--force` without `--limit` or date filters (or a new `INKWELL_O
 Exit codes: `0` ok · `1` config error · `2` some files errored/leak-blocked (see report) ·
 `3` no input / nothing selected.
 
+### Releasing
+
+1. `uv version X.Y.Z`; rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z]`; merge to `main`.
+2. `scripts/release.sh --dry-run X.Y.Z` runs every check, the Docker test suite and a local build.
+3. `scripts/release.sh X.Y.Z` does the same, then pushes tag `vX.Y.Z`. The `release` workflow
+   tests, builds, checks the distributions (`scripts/check_dist.py` allows only listed files),
+   installs the wheel into a clean environment, and publishes the GitHub release and image.
+
 ## Limits — human review still required
 
 * Handwriting and very degraded scans OCR poorly; pages flagged `low_ocr_confidence` in the
   report should be eyeballed. Unrecognized text can't be redacted.
-* `PERSON` redacts every detected name, including people whose names could stay.
-  `LOCATION` redacts all places.
+* `PERSON` redacts every detected name except permitted ones (see *Permitted names*).
+  `LOCATION` redacts all places except permitted ones (see *Permitted places*).
 * The withhold classifier is keyword-based. It is tuned to over-withhold (award letters
   that mention a fellowship or stipend count as financial aid in the example profile). Adjust
   `classify.py` or `INKWELL_WITHHOLD_THRESHOLD`.

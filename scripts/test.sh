@@ -4,9 +4,9 @@ set -euo pipefail
 cd "${0:A:h}/.."
 
 if [[ "${1:-}" == "--local" ]]; then
-  .venv/bin/ruff check src tests
-  .venv/bin/ruff format --check src tests
-  .venv/bin/mypy src
+  .venv/bin/ruff check src tests scripts
+  .venv/bin/ruff format --check src tests scripts
+  .venv/bin/mypy src scripts/check_dist.py
   .venv/bin/pytest -q
 else
   docker-compose build test

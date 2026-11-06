@@ -22,9 +22,18 @@ DIGITS = re.compile(r"\d{3}\D?\d{2}\D?\d{4}")
 
 def _assert_clean(text: str) -> None:
     assert SSN not in text
-    assert "6789" not in text
+    assert not re.search(r"(?<!\d)6789(?!\d)", text), "SSN last four digits"
     assert "Fernhollow" not in text and "FERNHOLLOW" not in text
     assert "Quintavius" not in text
+
+
+def test_assert_clean_ignores_random_digit_runs() -> None:
+    # MIME boundaries are 19 random digits; one containing "6789" is not an SSN fragment (this made
+    # test_eml_content_id_rewritten fail about once in a few hundred runs).
+    _assert_clean('boundary="===============3815937171678950541=="')
+    for leaked in ("SSN ends 6789", "XXX-XX-6789", "6789"):
+        with pytest.raises(AssertionError):
+            _assert_clean(leaked)
 
 
 # --- text / html ------------------------------------------------------------
@@ -377,3 +386,17 @@ def test_leakcheck_ignores_presentational_html_attrs(scrubber: object) -> None:
     html = b'<html><body><p style="font-family:Gill Sans">hello</p></body></html>'
     assert find_leaks("a.html", html, known) == []
     assert find_leaks("a.html", b'<html><body><p title="Gill">x</p></body></html>', known) != []
+
+
+def test_eml_container_name_params_scrubbed(ctx: Ctx) -> None:
+    # Regression guard: name=/filename= parameters on parts that are not replaced as
+    # attachments (e.g. a multipart container) must still be scrubbed.
+    m = EmailMessage()
+    m["From"] = "a@example.edu"
+    m["Subject"] = "x"
+    m.set_content("hello")
+    m.add_alternative("<p>hello</p>", subtype="html")
+    m.set_param("name", f"{STUDENT} file")
+    out = process("n.eml", m.as_bytes(), ctx)
+    assert out.data is not None
+    assert b"Fernhollow" not in out.data and b"Quintavius" not in out.data

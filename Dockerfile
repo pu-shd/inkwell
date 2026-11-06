@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.12.11-slim-bookworm AS base
+LABEL org.opencontainers.image.source="https://github.com/pu-shd/inkwell" \
+      org.opencontainers.image.description="Presidio-based scrubber for sensitive records"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -17,6 +19,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /usr/local/bin/uv
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project --no-dev
+COPY README.md ./
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
@@ -30,7 +33,9 @@ FROM base AS test
 USER root
 RUN uv sync --frozen
 COPY tests ./tests
+COPY CHANGELOG.md ./
+COPY scripts/check_dist.py ./scripts/
 USER scrub
 ENV RUFF_CACHE_DIR=/tmp/ruff-cache MYPY_CACHE_DIR=/tmp/mypy-cache
 ENTRYPOINT []
-CMD ["sh", "-c", "ruff check src tests && ruff format --check src tests && mypy src && pytest -q -p no:cacheprovider"]
+CMD ["sh", "-c", "ruff check src tests scripts && ruff format --check src tests scripts && mypy src scripts/check_dist.py && pytest -q -p no:cacheprovider"]

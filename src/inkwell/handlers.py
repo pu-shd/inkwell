@@ -26,7 +26,7 @@ from PIL import Image, ImageOps
 from . import imaging
 from .classify import classify
 from .config import Config
-from .engine import Findings, Scrubber, Word, layer_text, resolve_overlaps
+from .engine import Findings, Scrubber, Word, layer_text, redactable, resolve_overlaps
 from .sniff import image_format, output_ext, sniff
 
 MAX_DEPTH = 3
@@ -357,7 +357,9 @@ def redact_segments(
     if not results:
         return list(segs)
     findings.add(results)
-    merged = resolve_overlaps(results)
+    merged = resolve_overlaps(redactable(results))
+    if not merged:
+        return list(segs)
     ctx_ids = tuple(context_ids)
     out: list[str] = []
     for seg, (s, e) in zip(segs, spans, strict=True):
@@ -580,23 +582,37 @@ def handle_eml(data: bytes, ctx: Ctx) -> Outcome:
 
 
 def _scrub_headers(part: Message, ctx: Ctx, findings: Findings) -> None:
-    present = {k.lower() for k in part.keys()}
     subject = str(part["Subject"]) if part.get("Subject") is not None else None
-    had_addr = [h for h in _ADDR_HEADERS if h in present]
+    addr_values = {h: [str(v) for v in part.get_all(h, []) or []] for h in _ADDR_HEADERS}
     for k in set(part.keys()):
         if k.lower() not in _KEEP_HEADERS:
             del part[k]
     if subject is not None:
         del part["Subject"]
         part["Subject"] = ctx.scrubber.redact_text(subject, findings, ctx.extra_names, ctx.owner_ids)
-    for h in had_addr:
-        part[h.title()] = "REDACTED <redacted@invalid>"
-        findings.counts["EMAIL_ADDRESS"] += 1
+    for h, values in addr_values.items():
+        if values:
+            part[h.title()] = _scrub_addresses(values, ctx, findings)
     # filename= / name= parameters frequently contain people's names
     if part.get_param("name") is not None:
         part.set_param("name", "redacted")
     if part.get_param("filename", header="Content-Disposition") is not None:
         part.set_param("filename", "redacted", header="Content-Disposition")
+
+
+def _scrub_addresses(values: list[str], ctx: Ctx, findings: Findings) -> str:
+    """Every address becomes REDACTED <redacted@invalid>, except that a permitted person keeps
+    their display name (and, if contacts are allowed, their listed address)."""
+    from email.utils import formataddr
+
+    permitted, known = ctx.scrubber.permitted, ctx.scrubber.known
+    out = []
+    for disp, addr in getaddresses(values) or [("", "")]:
+        keep_name = bool(disp) and permitted.is_name(disp) and not known.is_registry_full_name(disp)
+        keep_addr = keep_name and permitted.is_contact("EMAIL_ADDRESS", addr)
+        findings.counts["PERMITTED_NAME" if keep_name else "EMAIL_ADDRESS"] += 1
+        out.append(formataddr((disp if keep_name else "REDACTED", addr if keep_addr else "redacted@invalid")))
+    return ", ".join(out)
 
 
 def _set_text(part: Message, text: str, subtype: str) -> None:

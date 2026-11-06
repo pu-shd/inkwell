@@ -417,6 +417,11 @@ class KnownNameRecognizer(EntityRecognizer):
     ) -> KnownNameRecognizer:
         return cls([("", list(names))], name=name, entity=entity)
 
+    def is_registry_full_name(self, name: str) -> bool:
+        """True if *name* (any order, 2+ tokens) is the full name or alias of a registry person."""
+        key = frozenset(t.lower() for t in name_variants(name)[1])
+        return len(key) >= 2 and key in self._key_ids
+
     def resolve(self, matched: str, context_ids: Iterable[str] = ()) -> str | None:
         """Registry ID for a matched name, or None when unknown or ambiguous.
 
