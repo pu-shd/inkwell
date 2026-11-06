@@ -5,9 +5,11 @@ Names and places that NER or the registry matcher find inside math are variables
 strict, because anything counted as math is not searched for names:
 
 * ``$...$`` follows the TeX-in-text rule used by pandoc: no space just inside either delimiter
-  and no digit right after the closing ``$``, so "paid $500 to Jane Roe for $20" is not math;
+  and no digit right after the closing ``$``, so "paid $500 to Jane Roe for $20" is not math; it
+  may wrap onto the next line but not cross a blank line;
 * ``$$...$$``, ``\\(...\\)``, ``\\[...\\]`` and equation-like environments;
-* a region with two adjacent capitalized words ("\\text{Jane Roe}") is treated as prose.
+* a region must contain a TeX command (or be a tiny ``$x$``); one with two adjacent
+  capitalized words ("\\text{Jane Roe}") or five ordinary words in a row is treated as prose.
 """
 
 from __future__ import annotations
@@ -21,9 +23,27 @@ _BLOCKS = (
     re.compile(r"\\\(.+?\\\)", re.S),
     re.compile(r"\\\[.+?\\\]", re.S),
 )
-_INLINE = re.compile(r"(?<![\\$])\$(?=[^\s$])[^$\n]{1,500}?(?<=[^\s\\])\$(?![\d$])")
+# TeX allows a line break inside $...$ but not a blank line (a paragraph break).
+_INLINE = re.compile(r"(?<![\\$])\$(?=[^\s$])(?:[^$\n]|\n(?![ \t]*\n)){1,500}?(?<=[^\s\\])\$(?![\d$])")
 _PROSE = re.compile(r"(?<![\\A-Za-z])[A-Z][a-z]+\s+[A-Z][a-z]+\b")
 _MAX_BLOCK = 20_000
+_CMD = re.compile(r"\\[A-Za-z]+")
+# Five ordinary words in a row is prose, not math (scripts and templates in saved web pages put
+# stray dollar signs around whole sentences).
+_WORD_RUN = re.compile(r"(?:[A-Za-z]{2,}[ \t\n,.;:'()]+){4}[A-Za-z]{2,}")
+
+
+def _looks_like_math(region: str) -> bool:
+    """A TeX command (or a tiny ``$x$``) and no prose. Operators alone are not enough: scripts and
+    templates in saved web pages put dollar signs, braces and "=" around whole sentences."""
+    if _PROSE.search(region):
+        return False
+    inner = region.strip("$").strip()
+    if len(inner) <= 3 and not re.search(r"[A-Za-z]{2,}", inner):
+        return True  # $x$, $n$, $x_i$
+    if _WORD_RUN.search(_CMD.sub(" ", region)):
+        return False
+    return bool(_CMD.search(region))
 
 
 def math_spans(text: str) -> list[tuple[int, int]]:
@@ -34,12 +54,12 @@ def math_spans(text: str) -> list[tuple[int, int]]:
     masked = text
     for rx in _BLOCKS:
         for m in rx.finditer(masked):
-            if m.end() - m.start() <= _MAX_BLOCK and not _PROSE.search(m.group()):
+            if m.end() - m.start() <= _MAX_BLOCK and _looks_like_math(m.group()):
                 spans.append((m.start(), m.end()))
         for s, e in spans:  # later patterns must not match inside an earlier region
             masked = masked[:s] + " " * (e - s) + masked[e:]
     for m in _INLINE.finditer(masked):
-        if not _PROSE.search(m.group()):
+        if _looks_like_math(m.group()):
             spans.append((m.start(), m.end()))
     spans.sort()
     merged: list[tuple[int, int]] = []

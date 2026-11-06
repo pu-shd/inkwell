@@ -232,10 +232,12 @@ Exit codes: `0` ok · `1` config error · `2` some files errored/leak-blocked (s
 Math is not a redaction target: names and places "found" in formulas are variables and operators.
 
 * Text formats (email, HTML, Office, text): LaTeX math regions (`$…$`, `$$…$$`, `\(…\)`,
-  `\[…\]`, `equation`/`align`-style environments) are left as they are. Inline `$…$` follows the
-  TeX-in-text rule (no space just inside the delimiters, no digit right after the closing `$`), so
-  dollar amounts are not math; a region with two adjacent capitalized words (`\text{Jane Roe}`) is
-  treated as prose.
+  `\[…\]`, `equation`/`align`-style environments) are left as they are. A region must contain a
+  TeX command (`\frac`, `\alpha`…) or be a tiny `$x$`: operators alone don't count, because scripts
+  and templates in saved pages put `$`, braces and `=` around whole sentences. Inline `$…$` follows
+  the TeX-in-text rule (no space just inside the delimiters, no digit right after the closing `$`;
+  it may wrap a line but not cross a blank line), so dollar amounts are not math. A region with two
+  adjacent capitalized words (`\text{Jane Roe}`) or five ordinary words in a row is prose.
 * PDFs with a text layer: words typeset in math fonts (Computer Modern/AMS/Euler math, OpenType
   math fonts…) stay visible, and are left out of the invisible text layer. A detection that spans
   math and ordinary words still boxes the ordinary words.

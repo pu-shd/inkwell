@@ -42,6 +42,10 @@ def test_math_regions_found(text: str) -> None:
         f"$ {STUDENT} $",  # space inside the delimiters
         rf"$\text{{{STUDENT}}}$",  # prose inside math
         f"No math here, {STUDENT}.",
+        # prose between stray dollar signs (scripts and templates in saved pages)
+        f"$(document).ready(function() {{ ask {SUR} at the office in Boston; }});$x",
+        f"$$ Please send the forms to {SUR} at the main office before Friday $$",
+        f"$.ajax({{ url: page, data: notes from {SUR} about the visit to Boston }});$",
     ],
 )
 def test_not_math(text: str) -> None:
@@ -62,10 +66,16 @@ def test_math_left_alone_names_outside_still_redacted(scrubber: Scrubber) -> Non
 
 
 def test_known_name_word_inside_math_is_a_variable(scrubber: Scrubber) -> None:
-    text = f"Define ${SUR}_i = x_i^2$ as before. {SUR} agreed."
+    text = f"Define $\\hat{{{SUR}}}_i = x_i^2$ as before. {SUR} agreed."
     out = _red(scrubber, text)
-    assert f"${SUR}_i = x_i^2$" in out and not out.rstrip().endswith(f"{SUR} agreed.")
+    assert f"$\\hat{{{SUR}}}_i = x_i^2$" in out and not out.rstrip().endswith(f"{SUR} agreed.")
     assert find_leaks("a.txt", out.encode(), scrubber.known) == [], "math is not a leak"
+
+
+def test_operators_without_a_tex_command_are_not_math(scrubber: Scrubber) -> None:
+    # "$a = {SUR}$" could be code in a saved page as easily as math: only TeX commands prove math.
+    assert _regions(f"Set $a = {SUR} + b$ now.") == []
+    assert SUR not in _red(scrubber, f"Set $a = {SUR} + b$ now.")
 
 
 def test_strong_identifiers_still_redacted_in_math(scrubber: Scrubber) -> None:
@@ -145,3 +155,31 @@ def test_pdf_math_font_preserved(
     assert "Lovelace" in ocr and "Babbage" in ocr, "the formula stays visible on the page"
     assert "Quintavius" not in ocr
     assert find_leaks("m.pdf", out.data, scrubber.known) == []
+
+
+# --- math spread over lines or HTML elements ------------------------------------------------------
+
+
+def test_prose_between_dollars_is_redacted(scrubber: Scrubber) -> None:
+    out = _red(scrubber, f"$(document).ready(function() {{ ask {STUDENT} at the office; }});$x")
+    assert SUR not in out and "Quintavius" not in out
+
+
+def test_inline_math_may_wrap_but_not_cross_a_paragraph() -> None:
+    assert _regions("Let $a +\n \\beta_i$ hold.") == ["$a +\n \\beta_i$"], "TeX allows a line break in $...$"
+    assert _regions("Costs $\\alpha\n\n b$ x") == [], "a blank line ends inline math"
+
+
+def test_html_math_split_over_elements_is_preserved(ctx: object) -> None:
+    from inkwell.handlers import process
+    from inkwell.leakcheck import extract_text
+
+    html = (
+        f"<html><body><p>Let $\\mathcal{{L}}(<i>{SUR}</i>, <b>Lovelace</b>) = \\sum_i x_i$ hold.</p>"
+        f"<p>{STUDENT} wrote this.</p></body></html>"
+    )
+    out = process("a.html", html.encode(), ctx)  # type: ignore[arg-type]
+    assert out.data
+    text = extract_text("a.html", out.data)
+    assert f"<i>{SUR}</i>" in out.data.decode() and "<b>Lovelace</b>" in out.data.decode(), "math kept"
+    assert "Quintavius" not in text, "the name outside math is still redacted"

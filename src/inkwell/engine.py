@@ -86,7 +86,12 @@ class Scrubber:
 
     # -- analysis -----------------------------------------------------------
 
-    def analyze(self, text: str, extra_names: Iterable[str] = ()) -> list[RecognizerResult]:
+    def analyze(
+        self, text: str, extra_names: Iterable[str] = (), math_view: str | None = None
+    ) -> list[RecognizerResult]:
+        """Detections in text. ``math_view`` (same length) is where math regions are looked for,
+        e.g. the text with HTML element separators as spaces, so a formula split over elements
+        is still one region."""
         text = clean_text(text)
         if not text.strip():
             return []
@@ -109,7 +114,8 @@ class Scrubber:
                 r.start += off
                 r.end += off
                 results.append(r)
-        spans = math_spans(text)
+        view = clean_text(math_view) if math_view is not None and len(math_view) == len(text) else text
+        spans = math_spans(view)
         if spans:  # names/places "found" in LaTeX math are variables; strong identifiers still count
             results = [r for r in results if r.entity_type in MATH_KEEP or not inside(r.start, r.end, spans)]
         return self._mark_permitted(text, _dedupe(results))

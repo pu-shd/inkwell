@@ -384,7 +384,9 @@ def redact_segments(
         parts.append(sep)
         pos += len(seg_text) + len(sep)
     text = "".join(parts)
-    results = sc.analyze(text, extra)
+    # Math may run across elements ("$f(<i>x</i>)$"): look for it with separators as spaces.
+    view = "".join(p if i % 2 == 0 else " " * len(p) for i, p in enumerate(parts))
+    results = sc.analyze(text, extra, math_view=view)
     if not results:
         return list(segs)
     findings.add(results)
