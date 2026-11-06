@@ -22,6 +22,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from . import __version__
 from .config import Config, ConfigError, load_config
 from .permitted import (
     PermittedNames,
@@ -545,7 +546,10 @@ def _preflight(cfg: Config) -> None:
     if cfg.tesseract_lang not in pytesseract.get_languages(config=""):
         raise ConfigError(f"tesseract language data missing: {cfg.tesseract_lang}")
     if not spacy.util.is_package(cfg.spacy_model):
-        raise ConfigError(f"spaCy model not installed: {cfg.spacy_model}")
+        raise ConfigError(
+            f"spaCy model not installed: {cfg.spacy_model} (it ships as a dependency of inkwell; "
+            "reinstall inkwell, or install the model from the spacy-models releases)"
+        )
 
 
 WARNINGS = {
@@ -625,6 +629,7 @@ def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="inkwell", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    ap.add_argument("--version", action="version", version=f"inkwell {__version__}")
     run = ap.add_argument_group("run modes")
     run.add_argument(
         "--dry-run",

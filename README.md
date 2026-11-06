@@ -69,6 +69,22 @@ Reassociating: find the person in `registry.csv` → `student_id` → output fol
 `*/S-…/` plus every `key.csv` row whose `student_ids` or `mentions` contains it.
 Destroying the key directory makes the output non-reidentifiable by these files.
 
+## Install
+
+From a release (needs Python 3.12 and Tesseract; the spaCy model, about 0.6 GB, comes with it):
+
+```zsh
+brew install tesseract uv
+uv tool install https://github.com/pu-shd/inkwell/releases/download/vX.Y.Z/inkwell-X.Y.Z-py3-none-any.whl
+inkwell --version
+```
+
+Each release also has the sdist, `SHA256SUMS` and build-provenance attestations
+(`gh attestation verify <file> -R pu-shd/inkwell`), and a container image
+`ghcr.io/pu-shd/inkwell:vX.Y.Z` (Tesseract included; run it network-isolated, as
+`scripts/docker-run.sh` does). Configuration is read from `INKWELL_*` environment variables
+(see `example.env`). From a clone, use `scripts/setup.sh` instead.
+
 ## Usage
 
 ```zsh
@@ -153,6 +169,14 @@ output requires `--force` without `--limit` or date filters (or a new `INKWELL_O
 
 Exit codes: `0` ok · `1` config error · `2` some files errored/leak-blocked (see report) ·
 `3` no input / nothing selected.
+
+### Releasing
+
+1. `uv version X.Y.Z`; rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z]`; merge to `main`.
+2. `scripts/release.sh --dry-run X.Y.Z` runs every check, the Docker test suite and a local build.
+3. `scripts/release.sh X.Y.Z` does the same, then pushes tag `vX.Y.Z`. The `release` workflow
+   tests, builds, checks the distributions (`scripts/check_dist.py` allows only listed files),
+   installs the wheel into a clean environment, and publishes the GitHub release and image.
 
 ## Limits — human review still required
 
