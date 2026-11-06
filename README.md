@@ -115,6 +115,11 @@ Ada Lovelace,"Augusta Ada King;A. Lovelace",ada@example.org,(555) 555-0100
   text already in each document (no OCR). It writes `permitted-suggestions-<time>.csv` beside
   the key, in the same format plus evidence columns, and applies nothing. Review it, delete rows,
   then point `INKWELL_PERMITTED_NAMES_FILE` at it.
+* Suggestions are only name-shaped text: at least two full words, no form labels, degrees,
+  markup, garbled encodings, initials-only forms, salutations or citations. Variants differing only
+  in initials share one row. Detection is still imprecise (streets, buildings, product names and
+  OCR fragments can get through); put site-specific words in `INKWELL_EXTRA_NAME_NOISE`, and
+  always review the list.
 
 ### Selecting by date
 

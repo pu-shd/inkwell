@@ -57,6 +57,95 @@ def name_key(text: str) -> frozenset[str]:
     return frozenset(t.strip("'’-") for t in tokens if t.strip("'’-") and t.strip("'’-") not in _TITLES)
 
 
+def variant_key(text: str) -> frozenset[str]:
+    """name_key without initials: groups suggestion variants ("Charles B. Babbage", "Charles
+    Babbage", "Babbage, Charles") into one row. Not used for matching."""
+    return frozenset(t for t in name_key(text) if len(t) > 1)
+
+
+# --- --suggest-permitted precision -----------------------------------------------------------
+# NER reports many PERSON spans that are not a person's full name: form labels, degrees, markup,
+# mojibake, initials, salutations, citations, places and services. candidate_name() keeps only
+# name-shaped text. Words below never occur in a name here; sites add more with
+# INKWELL_EXTRA_NAME_NOISE. Some rare surnames that are also such words are lost (add by hand).
+_NOISE = frozenset(
+    """name names first middle last family given initial initials maiden birth date place address
+    mailing email e-mail phone cell mobile fax box po suffix number student students account contact
+    contacts please print sent from subject cc examiner graduate undergraduate school office registrar
+    program programs administrator admin affairs university college department dept institute center
+    centre apartment apartments tower building library gymnasium memorial chapel drive street road
+    avenue ave blvd boulevard hotel hotels travel airlines management supplier service services
+    ticket detail details menu copy academic year semester term dissertation thesis laude cum summa
+    magna gpa fellowship scholarship degree degrees visitor leave absence incomplete notebook
+    learning deep random walk walks curriculum vitae resume language english data web webpage app
+    application user trip enroll save information info soon possible report reports form forms home
+    zip city state country signature signed regards sincerely thanks team committee board staff
+    studies eligible master ability st rd ln
+    as of the and for with on in at by to et al or""".split()
+)
+_SALUTATIONS = frozenset({"dear", "hi", "hello", "hey"})
+_PARTICLES = frozenset(
+    {"van", "von", "de", "der", "den", "da", "di", "del", "della", "du", "la", "le", "d'", "d’", "l'", "l’"}
+)
+# Typical UTF-8 read as Mac Roman / cp1252: "√©", "Ô¨Å", "‚Ä", "Ã©"; and U+FFFD.
+_MOJIBAKE = re.compile("[\u221a\u00d4\u00ac\u00c3\u00c2\u201a\u0152\u2022\u00c5\ufffd]")
+_ALLOWED = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ .'’-]+")
+_INITIAL = re.compile(r"(?:[A-Za-z]\.?|(?:[A-Za-z]\.){2,})")
+_WORD = re.compile(r"(?:[dlDL]['’])?[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]+")
+
+
+def _plain(token: str) -> str:
+    return token.lower().replace(".", "")
+
+
+def _shape(tokens: list[str], noise: frozenset[str]) -> str | None:
+    """I(nitial) / p(article) / F(ull word) per token, or None if a token can't be part of a name."""
+    shape = ""
+    for t in tokens:
+        if _plain(t) in _NOISE or _plain(t) in noise:
+            return None
+        if _INITIAL.fullmatch(t):
+            shape += "I"
+        elif t in _PARTICLES:
+            shape += "p"
+        elif _WORD.fullmatch(t) and not re.search(r"[A-Z]{2,}[a-z]", t):
+            shape += "F"
+        else:
+            return None
+    return shape
+
+
+def _full_name_shape(shape: str | None, n: int) -> bool:
+    # two full words; not ending in an initial; not two names run together ("A. Ada B. Byron")
+    return (
+        shape is not None
+        and shape.count("F") >= 2
+        and shape.endswith("F")
+        and n <= 5
+        and not re.search(r"I+F+I+F", shape)
+    )
+
+
+def candidate_name(text: str, noise: frozenset[str] = frozenset()) -> str | None:
+    """The text as a full personal name (salutation, titles and possessive removed), or None."""
+    s = re.sub(r"&[A-Za-z]+;?|&#\d+;?", " ", text)  # HTML entities cut into the span
+    s = re.sub(r"['’]s\s*$", "", re.sub(r"\s+", " ", s)).strip(" ,;")
+    if _MOJIBAKE.search(s) or not _ALLOWED.fullmatch(s):
+        return None
+    tokens = s.split()
+    while tokens and _plain(tokens[0]) in _SALUTATIONS:
+        tokens.pop(0)
+    while tokens and _plain(tokens[-1]) in _TITLES:
+        tokens.pop()
+    titled = tokens
+    while titled and _plain(titled[0]) in _TITLES:
+        titled = titled[1:]
+    for cand in (titled, tokens):  # "Dean J. Roe": Dean is the first name, not a title
+        if _full_name_shape(_shape(cand, noise), len(cand)):
+            return " ".join(cand)
+    return None
+
+
 def _digits(phone: str) -> str:
     return re.sub(r"\D", "", phone)
 

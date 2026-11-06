@@ -292,3 +292,104 @@ def test_suggest_job_skips_unreadable_file_without_failing(tmp_path: Path, scrub
     assert (owners, names) == (("S-X",), []) and ok in (True, False)
     missing = cli._suggest_job(cli.Job(str(tmp_path / "gone.pdf"), "gone.pdf", "p", 0, 0))
     assert missing[2] is False, "unreadable files are reported, not silently ignored"
+
+
+# --- suggestion precision: shapes that NER reported as PERSON but are not a person's full name ---
+NOT_NAMES = [
+    "First Name",
+    "Middle Name (or other name)",
+    "Last (Family) Name",
+    "Date Of Birth",
+    "Place of Birth",
+    "Maiden Name",
+    "Mailing Address",
+    "Email Address",
+    "Cell Phone",
+    "P.O. Box",
+    "Suffix (e.g., Jr.)",
+    "Student Number",
+    "summa cum laude",
+    "Magna Cum Laude",
+    "Ph.D.",
+    "M.A.",
+    'dir="ltr',
+    "Webpage:&nbsp",
+    'class="MsoNormal">Hi Ada',
+    "Ren√© Descartes",  # mojibake of "René"
+    "conÔ¬Årm",
+    "J. A.",
+    "S.J.",
+    "Ada B.",
+    "C. Babbage",
+    "Dear Ada",
+    "Dear Ada Lovelace",  # salutation stripped -> fine, see KEEP; first name alone is not
+    "Cai et al.",
+    "wil l",
+    "of student",
+    "Elm Street",
+    "Maple Drive",
+    "Grand Hotels",
+    "Office Of The Registrar",
+    "Soon As Possible",
+    "Deep Learning",
+    "Quartz PDFContext",
+    "smtpclient.apple",
+    "PT_AGSTARTPAGE_NUI",
+    "Ada Sent",
+    "C. Babbage A. Lovelace",
+    "Ada Lovelace A. B.",
+    "Please List Two Contacts.",
+]
+NOT_NAMES.remove("Dear Ada Lovelace")
+KEEP = {
+    "Ada Lovelace": "Ada Lovelace",
+    "Dear Ada Lovelace": "Ada Lovelace",
+    "Dr. Ada Lovelace": "Ada Lovelace",
+    "ADA K. LOVELACE": "ADA K. LOVELACE",
+    "Charles B. Babbage": "Charles B. Babbage",
+    "A. Ada Lovelace": "A. Ada Lovelace",
+    "Ada Lovelace's": "Ada Lovelace",
+    "Ada Lovelace-King": "Ada Lovelace-King",
+    "Ada O'Lovelace": "Ada O'Lovelace",
+    "Ada McLovelace": "Ada McLovelace",
+    "Ada van Lovelace": "Ada van Lovelace",
+    "Ada Lovelace,": "Ada Lovelace",
+    "René Descartes": "René Descartes",
+    "Ada Lovelace &lt": "Ada Lovelace",  # NER span cut at an escaped "<"
+    "Ada Lovelace Dean": "Ada Lovelace",  # trailing title of a signature
+    "Ada Lovelace Ph.D.": "Ada Lovelace",
+    "Dean Ada Lovelace": "Ada Lovelace",  # a title before a full name is dropped...
+    "Dean J. Lovelace": "Dean J. Lovelace",  # ...but kept when it must be the first name
+    "Ada d'Lovelace": "Ada d'Lovelace",
+    "Ada d' Lovelace": "Ada d' Lovelace",
+}
+
+
+@pytest.mark.parametrize("text", NOT_NAMES)
+def test_candidate_rejects_non_names(text: str) -> None:
+    from inkwell.permitted import candidate_name
+
+    assert candidate_name(text) is None
+
+
+@pytest.mark.parametrize(("text", "clean"), KEEP.items())
+def test_candidate_keeps_full_names(text: str, clean: str) -> None:
+    from inkwell.permitted import candidate_name
+
+    assert candidate_name(text) == clean
+
+
+def test_candidate_extra_noise_words() -> None:
+    from inkwell.permitted import candidate_name
+
+    assert candidate_name("Widget Lovelace") == "Widget Lovelace"
+    assert candidate_name("Widget Lovelace", noise=frozenset({"widget"})) is None
+
+
+def test_variant_key_groups_initials_but_name_key_does_not() -> None:
+    from inkwell.permitted import name_key, variant_key
+
+    assert (
+        variant_key("Charles B. Babbage") == variant_key("Charles Babbage") == variant_key("Babbage, Charles")
+    )
+    assert name_key("A. Lovelace") != name_key("Lovelace")  # aliases with initials stay specific

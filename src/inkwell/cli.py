@@ -23,7 +23,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .config import Config, ConfigError, load_config
-from .permitted import PermittedNames, PermittedPerson, load_permitted, name_key, write_people
+from .permitted import (
+    PermittedNames,
+    PermittedPerson,
+    candidate_name,
+    load_permitted,
+    variant_key,
+    write_people,
+)
 from .pseudonym import PseudonymMap
 from .registry import Registry
 
@@ -402,12 +409,15 @@ def _suggest_names(job: Job) -> tuple[tuple[str, ...], list[tuple[str, tuple[str
     kind = sniff(name, data)
     found: dict[frozenset[str], tuple[str, set[str]]] = {}
 
-    def add(surface: str, email: str = "") -> None:
-        surface = re.sub(r"<[^>]*>?|\S+@\S+", " ", surface)  # header text: drop addresses
-        surface = re.sub(r"\s+", " ", surface).strip(" ,;:<>\"'")
-        key = name_key(surface)
-        if not 2 <= len(key) <= 4 or re.search(r"\d", surface) or sc.known.is_registry_full_name(surface):
+    cfg: Config = _W["cfg"]  # type: ignore[assignment]
+    noise = frozenset(w.lower() for w in cfg.extra_name_noise)
+
+    def add(raw: str, email: str = "") -> None:
+        raw = re.sub(r"<[^>]*>?|\S+@\S+", " ", raw)  # header text: drop addresses
+        surface = candidate_name(raw.strip(" \"'"), noise)
+        if surface is None or sc.known.is_registry_full_name(surface):
             return
+        key = variant_key(surface)
         entry = found.setdefault(key, (surface, set()))
         if email:
             entry[1].add(email.lower())
@@ -448,7 +458,7 @@ def suggest_permitted(
             skipped += not ok
             for surface, addrs in names:
                 e = agg.setdefault(
-                    name_key(surface),
+                    variant_key(surface),
                     {"surfaces": Counter(), "people": set(), "docs": 0, "emails": Counter()},
                 )
                 e["surfaces"][surface] += 1  # type: ignore[index]
