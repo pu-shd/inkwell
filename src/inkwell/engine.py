@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -12,6 +13,7 @@ from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
+from .permitted import PermittedNames
 from .recognizers import KnownNameRecognizer, custom_recognizers
 
 CHUNK = 50_000
@@ -75,10 +77,16 @@ class Scrubber:
         self.anonymizer = AnonymizerEngine()
         self.entities = list(entities)
         self.threshold = score_threshold
+        self.permitted = PermittedNames([])
+
+    def set_permitted(self, permitted: PermittedNames) -> None:
+        """People whose full names (and optionally listed contacts) stay visible."""
+        self.permitted = permitted
 
     # -- analysis -----------------------------------------------------------
 
     def analyze(self, text: str, extra_names: Iterable[str] = ()) -> list[RecognizerResult]:
+        text = clean_text(text)
         if not text.strip():
             return []
         adhoc: list[EntityRecognizer] = []
@@ -100,7 +108,67 @@ class Scrubber:
                 r.start += off
                 r.end += off
                 results.append(r)
-        return _dedupe(results)
+        return self._mark_permitted(text, _dedupe(results))
+
+    def _mark_permitted(self, text: str, results: list[RecognizerResult]) -> list[RecognizerResult]:
+        """Relabel permitted names/contacts so they are counted but never redacted.
+
+        A span that overlaps a known record subject is never permitted (the registry wins).
+        Name-like results lying wholly inside a permitted name (e.g. a LOCATION on a surname)
+        are dropped so the permitted name stays whole."""
+        if not self.permitted:
+            return results
+        known = [(r.start, r.end) for r in results if r.entity_type == "KNOWN_STUDENT_NAME"]
+
+        def clear(start: int, end: int) -> bool:
+            return not any(s < end and e > start for s, e in known)
+
+        spans: list[tuple[int, int]] = []
+        persons = sorted((r for r in results if r.entity_type == "PERSON"), key=lambda r: r.start)
+        extra: list[RecognizerResult] = []
+        for r in persons:
+            win = self._permitted_window(text, r.start, r.end)
+            if win is None or not clear(*win):
+                continue
+            spans.append(win)
+            # NER spans can run past the name ("Ada Lovelace\nStudent"): the rest stays redacted.
+            for s, e in ((r.start, win[0]), (win[1], r.end)):
+                if re.search(r"[A-Za-z]", text[s:e]):
+                    extra.append(RecognizerResult("PERSON", s, e, r.score))
+        # "Lovelace, Ada": NER often tags the two parts separately; judge them as one name.
+        for a, b in zip(persons, persons[1:], strict=False):
+            gap = text[a.end : b.start]
+            if a.end <= b.start and re.fullmatch(r"[\s,]+", gap or "x") and clear(a.start, b.end):
+                if self.permitted.is_name(text[a.start : b.end]):
+                    spans.append((a.start, b.end))
+        out: list[RecognizerResult] = []
+        for r in results:
+            if r.entity_type == "PERSON" and any(s < r.end and e > r.start for s, e in spans):
+                for s, e in spans:  # the permitted part(s) of this span are counted, not redacted
+                    if s >= r.start and e <= r.end or (s <= r.start and r.end <= e):
+                        out.append(
+                            RecognizerResult("PERMITTED_NAME", max(s, r.start), min(e, r.end), r.score)
+                        )
+                continue
+            if self.permitted.is_contact(r.entity_type, text[r.start : r.end]):
+                r.entity_type = "PERMITTED_CONTACT"
+            if r.entity_type == "LOCATION" and _inside(r, spans):
+                continue
+            out.append(r)
+        return _dedupe(out + extra)
+
+    def _permitted_window(self, text: str, start: int, end: int) -> tuple[int, int] | None:
+        """The whole span if it is a permitted name, else the first 2-4 word window inside it
+        that is (so a name followed by a stray word still matches)."""
+        if self.permitted.is_name(text[start:end]):
+            return start, end
+        words = [(m.start() + start, m.end() + start) for m in re.finditer(r"[^\s,;:()]+", text[start:end])]
+        for size in (4, 3, 2):
+            for i in range(len(words) - size + 1):
+                s, e = words[i][0], words[i + size - 1][1]
+                if self.permitted.is_name(text[s:e]):
+                    return s, e
+        return None
 
     def label(self, entity: str, matched: str, context_ids: Iterable[str], findings: Findings) -> str:
         """Replacement text. Known record subjects become their registry ID, so mentions of the same
@@ -121,12 +189,15 @@ class Scrubber:
         extra_names: Iterable[str] = (),
         context_ids: Iterable[str] = (),
     ) -> str:
+        text = clean_text(text)
         results = self.analyze(text, extra_names)
         if not results:
             return text
         findings.add(results)
         ctx = tuple(context_ids)
-        resolved = resolve_overlaps(results)
+        resolved = resolve_overlaps(redactable(results))
+        if not resolved:
+            return text
         out = self.anonymizer.anonymize(
             text=text,
             analyzer_results=resolved,  # type: ignore[arg-type]
@@ -165,7 +236,7 @@ class Scrubber:
         hit: set[int] = set()
         labels: dict[int, str] = {}
         ctx = tuple(context_ids)
-        for r in resolve_overlaps(results):
+        for r in resolve_overlaps(redactable(results)):
             covered = [i for i, (s, e) in enumerate(spans) if s < r.end and e > r.start]
             hit.update(covered)
             if covered and r.entity_type == "KNOWN_STUDENT_NAME":
@@ -173,6 +244,15 @@ class Scrubber:
                 if lab != "<KNOWN_STUDENT_NAME>":
                     labels[covered[0]] = lab.strip("<>")
         return sorted(hit), labels
+
+
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def clean_text(text: str) -> str:
+    """Replace lone surrogates (seen in some PDF text extraction) with U+FFFD, one for one, so
+    the text can be tokenized and encoded while every offset stays the same."""
+    return _SURROGATE.sub("\ufffd", text)
 
 
 def layer_text(text: str) -> str:
@@ -226,6 +306,18 @@ def _dedupe(results: list[RecognizerResult]) -> list[RecognizerResult]:
             seen.add(key)
             out.append(r)
     return out
+
+
+KEEP = frozenset({"PERMITTED_NAME", "PERMITTED_CONTACT"})
+
+
+def _inside(r: RecognizerResult, spans: Iterable[tuple[int, int]]) -> bool:
+    return any(s <= r.start and r.end <= e for s, e in spans)
+
+
+def redactable(results: Iterable[RecognizerResult]) -> list[RecognizerResult]:
+    """Results that must be redacted (permitted names/contacts are only counted)."""
+    return [r for r in results if r.entity_type not in KEEP]
 
 
 def _pick_label(a: RecognizerResult, b: RecognizerResult) -> str:

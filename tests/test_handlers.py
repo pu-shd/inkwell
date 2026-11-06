@@ -377,3 +377,17 @@ def test_leakcheck_ignores_presentational_html_attrs(scrubber: object) -> None:
     html = b'<html><body><p style="font-family:Gill Sans">hello</p></body></html>'
     assert find_leaks("a.html", html, known) == []
     assert find_leaks("a.html", b'<html><body><p title="Gill">x</p></body></html>', known) != []
+
+
+def test_eml_container_name_params_scrubbed(ctx: Ctx) -> None:
+    # Regression guard: name=/filename= parameters on parts that are not replaced as
+    # attachments (e.g. a multipart container) must still be scrubbed.
+    m = EmailMessage()
+    m["From"] = "a@example.edu"
+    m["Subject"] = "x"
+    m.set_content("hello")
+    m.add_alternative("<p>hello</p>", subtype="html")
+    m.set_param("name", f"{STUDENT} file")
+    out = process("n.eml", m.as_bytes(), ctx)
+    assert out.data is not None
+    assert b"Fernhollow" not in out.data and b"Quintavius" not in out.data

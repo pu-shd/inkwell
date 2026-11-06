@@ -92,6 +92,30 @@ scripts/test.sh                   # lint + mypy + tests in Docker (CI); --local 
 | `INKWELL_EXTRA_ID_LABELS` | extra form labels that precede an ID number | `XUID,Member ID` |
 | `INKWELL_EXTRA_NAME_NOISE` | words in folder names that are not names (codes, departments) | `msc,ba` |
 
+### Permitted names
+
+Names of people who may stay visible (staff, officials, signatories…) go in a CSV beside the
+key file, set with `INKWELL_PERMITTED_NAMES_FILE`:
+
+```csv
+name,aliases,emails,phones
+Ada Lovelace,"Augusta Ada King;A. Lovelace",ada@example.org,(555) 555-0100
+```
+
+* Full names only, matched in either order and ignoring case and titles (`Dr. Ada Lovelace`,
+  `Lovelace, Ada`). A lone surname or first name stays redacted.
+* Record subjects always win: an entry that is also a registry person is dropped at startup
+  (counted as `permitted_conflicts` in the summary, listed in `permitted-conflicts.csv` beside the
+  key), and any span overlapping a known subject stays redacted.
+* Only names are kept. With `INKWELL_PERMITTED_CONTACTS=true`, the listed emails and phone
+  numbers of permitted people are kept too; nothing else is.
+* Kept names are counted as `PERMITTED_NAME` (and `PERMITTED_CONTACT`) in the report.
+* `--suggest-permitted [--min-students N]` drafts a list from full names that appear in the
+  files of at least N different registry people (default 3), from email display names and the
+  text already in each document (no OCR). It writes `permitted-suggestions-<time>.csv` beside
+  the key, in the same format plus evidence columns, and applies nothing. Review it, delete rows,
+  then point `INKWELL_PERMITTED_NAMES_FILE` at it.
+
 ### Selecting by date
 
 `--modified-after/--modified-before` and `--created-after/--created-before` take a date
@@ -129,7 +153,7 @@ Exit codes: `0` ok · `1` config error · `2` some files errored/leak-blocked (s
 
 * Handwriting and very degraded scans OCR poorly; pages flagged `low_ocr_confidence` in the
   report should be eyeballed. Unrecognized text can't be redacted.
-* `PERSON` redacts every detected name, including people whose names could stay.
+* `PERSON` redacts every detected name except permitted ones (see *Permitted names*).
   `LOCATION` redacts all places.
 * The withhold classifier is keyword-based. It is tuned to over-withhold (award letters
   that mention a fellowship or stipend count as financial aid in the example profile). Adjust

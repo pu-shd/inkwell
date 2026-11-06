@@ -100,3 +100,15 @@ def test_name_particles_not_standalone_tokens() -> None:
     phrases, tokens = name_variants("Maria De Souza")
     assert "De" not in tokens and {"Maria", "Souza"} <= tokens
     assert "Maria De Souza" in phrases
+
+
+def test_lone_surrogates_do_not_crash_analysis(scrubber: Scrubber) -> None:
+    # Regression: PDF text extraction can yield lone surrogates; spaCy raised
+    # UnicodeEncodeError and ended a whole --suggest-permitted pass.
+    text = f"SSN: {SSN} 😀 bad \udcff\udcfe Quintavius Fernhollow"
+    results = scrubber.analyze(text)
+    found = {text[r.start : r.end] for r in results}
+    assert SSN in found and any("Fernhollow" in s for s in found), "offsets must stay aligned"
+    f = Findings()
+    out = scrubber.redact_text(text, f)
+    assert SSN not in out and "Fernhollow" not in out

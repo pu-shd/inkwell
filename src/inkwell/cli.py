@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .config import Config, ConfigError, load_config
+from .permitted import PermittedNames, PermittedPerson, load_permitted, name_key, write_people
 from .pseudonym import PseudonymMap
 from .registry import Registry
 
@@ -75,7 +76,12 @@ class JobResult:
 _W: dict[str, object] = {}
 
 
-def _init_worker(cfg: Config, students: list[tuple[str, list[str]]], mode: Mode) -> None:
+def _init_worker(
+    cfg: Config,
+    students: list[tuple[str, list[str]]],
+    mode: Mode,
+    permitted: list[PermittedPerson] | None = None,
+) -> None:
     os.environ.setdefault("OMP_THREAD_LIMIT", "1")  # tesseract: parallelism comes from processes
     logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
     from .engine import Scrubber
@@ -92,6 +98,8 @@ def _init_worker(cfg: Config, students: list[tuple[str, list[str]]], mode: Mode)
         students=students,
         extra_id_labels=cfg.extra_id_labels,
     )
+    if permitted:
+        _W["scrubber"].set_permitted(PermittedNames(permitted, cfg.permitted_contacts))  # type: ignore[attr-defined]
 
 
 def _run_job(job: Job) -> JobResult:
@@ -356,6 +364,131 @@ def _contains_image(name: str, data: bytes, depth: int = 0) -> bool:
     return False
 
 
+def _load_permitted(
+    cfg: Config, students: list[tuple[str, list[str]]]
+) -> tuple[list[PermittedPerson], list[PermittedPerson]]:
+    """Permitted people minus anyone who is a registry person (the registry always wins)."""
+    if cfg.permitted_names_file is None:
+        return [], []
+    from .recognizers import KnownNameRecognizer
+
+    people = load_permitted(cfg.permitted_names_file)
+    return PermittedNames.without_students(people, KnownNameRecognizer(students))
+
+
+def _suggest_job(job: Job) -> tuple[tuple[str, ...], list[tuple[str, tuple[str, ...]]], bool]:
+    """(owners, names found, ok). A file that can't be read is skipped and counted, never fatal."""
+    try:
+        owners, names = _suggest_names(job)
+        return owners, names, True
+    except Exception:  # noqa: BLE001 - one bad file must not end the pass
+        return job.owner_ids, [], False
+
+
+def _suggest_names(job: Job) -> tuple[tuple[str, ...], list[tuple[str, tuple[str, ...]]]]:
+    """Full names in one document: email display names (with their addresses) and PERSON
+    entities in its existing text. No OCR, so scanned pages are not considered."""
+    from email import policy
+    from email.parser import BytesParser
+    from email.utils import getaddresses
+
+    from .engine import Scrubber
+    from .leakcheck import extract_text
+    from .sniff import sniff
+
+    sc: Scrubber = _W["scrubber"]  # type: ignore[assignment]
+    name = PurePosixPath(job.rel).name
+    data = Path(job.src).read_bytes()
+    kind = sniff(name, data)
+    found: dict[frozenset[str], tuple[str, set[str]]] = {}
+
+    def add(surface: str, email: str = "") -> None:
+        surface = re.sub(r"<[^>]*>?|\S+@\S+", " ", surface)  # header text: drop addresses
+        surface = re.sub(r"\s+", " ", surface).strip(" ,;:<>\"'")
+        key = name_key(surface)
+        if not 2 <= len(key) <= 4 or re.search(r"\d", surface) or sc.known.is_registry_full_name(surface):
+            return
+        entry = found.setdefault(key, (surface, set()))
+        if email:
+            entry[1].add(email.lower())
+
+    if kind in ("drop", "unsupported", "image"):
+        return job.owner_ids, []
+    if kind == "eml":
+        msg = BytesParser(policy=policy.compat32).parsebytes(data)
+        for part in msg.walk():
+            for h in ("from", "to", "cc", "reply-to", "sender"):
+                for disp, addr in getaddresses([str(v) for v in part.get_all(h, []) or []]):
+                    if disp:
+                        add(disp, addr)
+    try:
+        text = extract_text(name, data)[:300_000]
+    except Exception:  # noqa: BLE001 - a suggestion pass must not stop on one bad file
+        text = ""
+    results = sc.analyze(text)
+    known = [(r.start, r.end) for r in results if r.entity_type == "KNOWN_STUDENT_NAME"]
+    for r in results:
+        if r.entity_type == "PERSON" and not any(s < r.end and e > r.start for s, e in known):
+            add(text[r.start : r.end])
+    return job.owner_ids, [(surface, tuple(sorted(emails))) for surface, emails in found.values()]
+
+
+def suggest_permitted(
+    cfg: Config, students: list[tuple[str, list[str]]], jobs: list[Job], min_people: int
+) -> int:
+    """Write permitted-suggestions-<time>.csv (permitted-names format plus evidence columns)
+    beside the key file. Nothing is applied automatically; nothing touches the output."""
+    agg: dict[frozenset[str], dict[str, object]] = {}
+    skipped = 0
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        cfg.workers, initializer=_init_worker, initargs=(cfg, students, Mode(dry_run=True))
+    ) as pool:
+        for owners, names, ok in pool.imap_unordered(_suggest_job, jobs, chunksize=4):
+            skipped += not ok
+            for surface, addrs in names:
+                e = agg.setdefault(
+                    name_key(surface),
+                    {"surfaces": Counter(), "people": set(), "docs": 0, "emails": Counter()},
+                )
+                e["surfaces"][surface] += 1  # type: ignore[index]
+                e["people"] |= set(owners)  # type: ignore[operator]
+                e["docs"] += 1  # type: ignore[operator]
+                e["emails"].update(addrs)  # type: ignore[attr-defined]
+    rows = []
+    for e in agg.values():
+        people: set[str] = e["people"]  # type: ignore[assignment]
+        if len(people) < min_people:
+            continue
+        surfaces: Counter[str] = e["surfaces"]  # type: ignore[assignment]
+        plain = [s for s, _ in surfaces.most_common() if "," not in s] or [surfaces.most_common(1)[0][0]]
+        seen: Counter[str] = e["emails"]  # type: ignore[assignment]
+        rows.append(
+            [
+                plain[0],
+                "",
+                ";".join(m for m, _ in seen.most_common(3)),
+                "",
+                str(len(people)),
+                str(e["docs"]),
+            ]
+        )
+    rows.sort(key=lambda r: (-int(r[4]), -int(r[5]), r[0]))
+    out = cfg.key_file.parent / f"permitted-suggestions-{dt.datetime.now():%Y%m%d-%H%M%S}.csv"
+    write_people(out, rows, extra_header=("evidence_students", "evidence_documents"))
+    log.info(
+        "suggested %d permitted name(s) seen in the files of >= %d people; review, then point "
+        "INKWELL_PERMITTED_NAMES_FILE at it: %s",
+        len(rows),
+        min_people,
+        out,
+    )
+    if skipped:
+        log.warning("%d file(s) could not be read and were skipped; suggestions may be incomplete", skipped)
+        return 2
+    return 0
+
+
 def audit(cfg: Config, registry: Registry) -> int:
     """Fail closed on outputs produced by older code: anything that no longer passes the
     current leak check, and every image (no text layer to check), is deleted."""
@@ -506,6 +639,20 @@ def _parser() -> argparse.ArgumentParser:
         help="re-run the leak check over existing outputs; delete failures and images so "
         "the next run reprocesses them (use after a recognizer fix)",
     )
+    run.add_argument(
+        "--suggest-permitted",
+        action="store_true",
+        help="draft a permitted-names list from full names that recur across many people's files "
+        "(email display names and existing text, no OCR); written beside the key for review",
+    )
+    run.add_argument(
+        "--min-students",
+        type=int,
+        default=3,
+        metavar="N",
+        help="--suggest-permitted: a name must appear in the files of at least N different "
+        "registry people (default 3)",
+    )
     sel = ap.add_argument_group("selection (WHEN: 2019-09-01, 2019-09-01T08:30, or an age: 30d, 12h, 2w)")
     sel.add_argument("--modified-after", metavar="WHEN", help="only files last modified at/after WHEN")
     sel.add_argument("--modified-before", metavar="WHEN", help="only files last modified before WHEN")
@@ -534,8 +681,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not mode.redact and not mode.withhold:
             raise ConfigError("--no-redact with --no-withhold would copy every record unprotected; refused")
-        if sum(map(bool, (args.dry_run, args.plan_only, args.audit))) > 1:
-            raise ConfigError("choose one of --dry-run, --plan-only, --audit")
+        if sum(map(bool, (args.dry_run, args.plan_only, args.audit, args.suggest_permitted))) > 1:
+            raise ConfigError("choose one of --dry-run, --plan-only, --audit, --suggest-permitted")
+        if args.min_students < 2:
+            raise ConfigError("--min-students must be at least 2")
         if args.report and not args.dry_run:
             raise ConfigError("--report applies to --dry-run")
         window = Window(
@@ -571,9 +720,11 @@ def main(argv: list[str] | None = None) -> int:
         known_before = set(pmap.rows)
         if args.audit:
             return audit(cfg, registry)
+        students = student_table(cfg, registry)
+        permitted, conflicts = _load_permitted(cfg, students)
         all_jobs = plan(cfg, pmap)
         jobs = [j for j in all_jobs if window.matches(j)]
-        if not (args.dry_run or args.plan_only):
+        if not (args.dry_run or args.plan_only or args.suggest_permitted):
             _check_mode(cfg, mode, args, window)
     except (ConfigError, ValueError) as exc:
         log.error("configuration error: %s", exc)
@@ -590,6 +741,22 @@ def main(argv: list[str] | None = None) -> int:
     warnings = _mode_warnings(mode)
     for wtext in warnings:
         log.warning("%s", wtext.replace("\n", " "))
+
+    if conflicts:
+        log.warning(
+            "%d permitted name(s) are also registry people and will stay redacted%s",
+            len(conflicts),
+            "" if args.dry_run or args.plan_only else "; listed in permitted-conflicts.csv beside the key",
+        )
+    if not (args.dry_run or args.plan_only or args.suggest_permitted):
+        cfile = cfg.key_file.parent / "permitted-conflicts.csv"
+        if conflicts:
+            write_people(cfile, ([p.name, ";".join(p.aliases), "", ""] for p in conflicts))
+        else:
+            cfile.unlink(missing_ok=True)
+
+    if args.suggest_permitted:
+        return suggest_permitted(cfg, students, jobs, args.min_students)
 
     if args.plan_only:
         from .sniff import sniff
@@ -637,10 +804,12 @@ def main(argv: list[str] | None = None) -> int:
         if new_report:
             w.writerow(REPORT_FIELDS)
     ctx = mp.get_context("spawn")
-    students = student_table(cfg, registry)
     try:
         with ctx.Pool(
-            cfg.workers, initializer=_init_worker, initargs=(cfg, students, mode), maxtasksperchild=200
+            cfg.workers,
+            initializer=_init_worker,
+            initargs=(cfg, students, mode, permitted),
+            maxtasksperchild=200,
         ) as pool:
             for i, r in enumerate(pool.imap_unordered(_run_job, todo, chunksize=1), 1):
                 statuses[r.status] += 1
@@ -694,6 +863,8 @@ def main(argv: list[str] | None = None) -> int:
         "processed": len(todo),
         "statuses": dict(statuses),
         "entities": dict(entities),
+        "permitted_names": len(permitted),
+        "permitted_conflicts": len(conflicts),
     }
     if args.dry_run:
         log.info("DRY RUN summary: %s", json.dumps(summary))
