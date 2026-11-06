@@ -1,0 +1,29 @@
+services:
+  test:
+    build:
+      context: .
+      target: test
+    image: inkwell:test
+    network_mode: none
+
+  scrub:
+    build:
+      context: .
+      target: base
+    image: inkwell:latest
+    # No network: records never leave the machine.
+    network_mode: none
+    environment:
+      INKWELL_INPUT_DIR: /data/input
+      INKWELL_OUTPUT_DIR: /data/output
+      INKWELL_KEY_FILE: /data/key/key.csv
+      INKWELL_WORKERS: ${INKWELL_WORKERS:-4}
+      INKWELL_DPI: ${INKWELL_DPI:-300}
+      INKWELL_JPEG_QUALITY: ${INKWELL_JPEG_QUALITY:-70}
+      INKWELL_SCORE_THRESHOLD: ${INKWELL_SCORE_THRESHOLD:-0.35}
+      INKWELL_WITHHOLD_THRESHOLD: ${INKWELL_WITHHOLD_THRESHOLD:-3}
+    # scripts/docker-run.sh exports these from .env; inkwell fails fast if they are wrong.
+    volumes:
+      - ${HOST_INPUT_DIR:-./.unset-input}:/data/input:ro
+      - ${HOST_OUTPUT_DIR:-./.unset-output}:/data/output
+      - ${HOST_KEY_DIR:-./.unset-key}:/data/key

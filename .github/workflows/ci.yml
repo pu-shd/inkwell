@@ -1,0 +1,13 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build test image
+        run: docker compose build test
+      - name: Lint, type-check, test (no network)
+        run: docker compose run --rm test

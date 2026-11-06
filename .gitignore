@@ -1,0 +1,18 @@
+.env*
+!example.env
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+*.db
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# never commit records, outputs or key files
+key.csv
+*scrubbed*/
+CLAUDE.md
+.claude/
