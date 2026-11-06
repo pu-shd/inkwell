@@ -22,9 +22,18 @@ DIGITS = re.compile(r"\d{3}\D?\d{2}\D?\d{4}")
 
 def _assert_clean(text: str) -> None:
     assert SSN not in text
-    assert "6789" not in text
+    assert not re.search(r"(?<!\d)6789(?!\d)", text), "SSN last four digits"
     assert "Fernhollow" not in text and "FERNHOLLOW" not in text
     assert "Quintavius" not in text
+
+
+def test_assert_clean_ignores_random_digit_runs() -> None:
+    # MIME boundaries are 19 random digits; one containing "6789" is not an SSN fragment (this made
+    # test_eml_content_id_rewritten fail about once in a few hundred runs).
+    _assert_clean('boundary="===============3815937171678950541=="')
+    for leaked in ("SSN ends 6789", "XXX-XX-6789", "6789"):
+        with pytest.raises(AssertionError):
+            _assert_clean(leaked)
 
 
 # --- text / html ------------------------------------------------------------
