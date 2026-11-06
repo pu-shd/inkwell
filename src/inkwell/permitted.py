@@ -191,16 +191,114 @@ def load_permitted(path: Path) -> list[PermittedPerson]:
     return people
 
 
+# --- permitted places ------------------------------------------------------------------------
+# Institutional place names (campus, buildings, the institution's town) that may stay visible.
+# They only ever unmask results the NER typed LOCATION; labeled personal fields (place of birth,
+# addresses), street-address patterns and record subjects' names stay redacted.
+
+PLACE_COLUMNS = ("place", "aliases")
+_MAX_PLACE = 80
+_PLACE_ALLOWED = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ .,'’&-]+")
+_PLACE_LOWER_OK = frozenset({"of", "the", "and", "on", "upon", "de", "du", "la", "le", "del", "y", "&"})
+# Words that make a LOCATION result a form label, another institution or a subject, not a place to
+# permit. Sites add more with INKWELL_EXTRA_NAME_NOISE.
+_PLACE_NOISE = frozenset(
+    """home city birth native country iso initial initials middle name names residence citizenship
+    nationality form forms notice trip overview questionnaire exit level lower upper student
+    students univ university college school institute vol field major sem travel transportation
+    engineering economics music modeling calculus financial history research""".split()
+)
+_PLACE_ABBREV_OK = frozenset({"st.", "mt.", "ft."})
+
+
+def place_key(text: str) -> str:
+    """Case-, punctuation- and leading-'the'-insensitive identity of a place name."""
+    s = re.sub(r"[.,;:'’()\"]", " ", text.lower())
+    s = re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"^the ", "", s)
+
+
+@dataclass(frozen=True)
+class PermittedPlace:
+    place: str
+    aliases: tuple[str, ...] = ()
+
+    def names(self) -> tuple[str, ...]:
+        return (self.place, *self.aliases)
+
+
+def load_places(path: Path) -> list[PermittedPlace]:
+    try:
+        fh = path.open(newline="", encoding="utf-8-sig")
+    except OSError as exc:
+        raise ConfigError(f"permitted places file cannot be read: {exc.strerror}") from exc
+    with fh:
+        reader = csv.DictReader(fh)
+        header = tuple(reader.fieldnames or ())
+        extra = [c for c in header[len(PLACE_COLUMNS) :] if not c.startswith(EVIDENCE_PREFIX)]
+        if header[: len(PLACE_COLUMNS)] != PLACE_COLUMNS or extra:
+            raise ConfigError(f"permitted places file header must be {','.join(PLACE_COLUMNS)}")
+        places: list[PermittedPlace] = []
+        for line, row in enumerate(reader, start=2):
+            aliases = tuple(x.strip() for x in (row.get("aliases") or "").split(";") if x.strip())
+            place = PermittedPlace((row.get("place") or "").strip(), aliases)
+            for n in place.names():
+                if re.search(r"\d", n):
+                    raise ConfigError(
+                        f"permitted places file line {line}: digits are not allowed "
+                        "(street addresses and postal codes always stay redacted)"
+                    )
+                if len(n) > _MAX_PLACE:
+                    raise ConfigError(f"permitted places file line {line}: place name too long")
+                if len(re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", n)) < 2:
+                    raise ConfigError(f"permitted places file line {line}: a place is required")
+            places.append(place)
+    return places
+
+
+def candidate_place(text: str, noise: frozenset[str] = frozenset()) -> str | None:
+    """The text as a suggestible place name, or None: markup, mojibake, digits, lowercase prose,
+    form labels, dotted abbreviations ("U.S.A"), other institutions, subjects. Codes such as "IL"
+    are left to the share threshold, which keeps the institution's own state and drops others."""
+    s = re.sub(r"\s+", " ", text).strip(" ,;:.")
+    s = re.sub(r"^(?:the|The)\s+", "", s)
+    if _MOJIBAKE.search(s) or not _PLACE_ALLOWED.fullmatch(s) or len(s) > _MAX_PLACE:
+        return None
+    words = [w.strip(",.") for w in s.split() if w.strip(",.")]
+    if not 1 <= len(words) <= 6 or len(re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", s)) < 2:
+        return None
+    if not words[0][0].isupper() or any(not w[0].isupper() and w not in _PLACE_LOWER_OK for w in words):
+        return None
+    for raw in s.split():
+        w = raw.strip(",")
+        low = w.lower().strip(".")
+        if low in _PLACE_NOISE or low in noise:
+            return None
+        if "." in w.rstrip(".") or (w.endswith(".") and w.lower() not in _PLACE_ABBREV_OK):
+            return None  # "U.S.A", "D.C", "Ph.D." (but "St. Louis")
+    return s
+
+
 class PermittedNames:
-    def __init__(self, people: Iterable[PermittedPerson], allow_contacts: bool = False) -> None:
+    def __init__(
+        self,
+        people: Iterable[PermittedPerson],
+        allow_contacts: bool = False,
+        places: Iterable[PermittedPlace] = (),
+    ) -> None:
         self.people = list(people)
+        self.places = list(places)
         self.allow_contacts = allow_contacts
         self._keys = {name_key(n) for p in self.people for n in p.names()}
         self._emails = {e.lower() for p in self.people for e in p.emails}
         self._phones = {_digits(x) for p in self.people for x in p.phones}
+        self._places = {place_key(n) for p in self.places for n in p.names()}
 
     def __bool__(self) -> bool:
-        return bool(self._keys)
+        return bool(self._keys or self._places)
+
+    def is_place(self, text: str) -> bool:
+        return bool(self._places) and place_key(text) in self._places
 
     def is_name(self, text: str) -> bool:
         key = name_key(text)
@@ -227,14 +325,19 @@ class PermittedNames:
         return kept, conflicts
 
 
-def write_people(path: Path, rows: Iterable[Sequence[str]], extra_header: Sequence[str] = ()) -> None:
-    """Owner-only CSV in the permitted-names format (used for conflicts and suggestions)."""
+def write_people(
+    path: Path,
+    rows: Iterable[Sequence[str]],
+    extra_header: Sequence[str] = (),
+    columns: Sequence[str] = COLUMNS,
+) -> None:
+    """Owner-only CSV in the permitted-names (or, with PLACE_COLUMNS, places) format."""
     import os
 
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow([*COLUMNS, *extra_header])
+        w.writerow([*columns, *extra_header])
         for r in rows:
             w.writerow(r)

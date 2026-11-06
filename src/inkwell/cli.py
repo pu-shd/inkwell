@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import re
@@ -21,19 +22,28 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from . import __version__
 from .config import Config, ConfigError, load_config
 from .permitted import (
+    PLACE_COLUMNS,
     PermittedNames,
     PermittedPerson,
+    PermittedPlace,
     candidate_name,
+    candidate_place,
     load_permitted,
+    load_places,
+    place_key,
     variant_key,
     write_people,
 )
 from .pseudonym import PseudonymMap
 from .registry import Registry
+
+if TYPE_CHECKING:
+    from presidio_analyzer import RecognizerResult
 
 log = logging.getLogger("inkwell")
 
@@ -89,6 +99,7 @@ def _init_worker(
     students: list[tuple[str, list[str]]],
     mode: Mode,
     permitted: list[PermittedPerson] | None = None,
+    places: list[PermittedPlace] | None = None,
 ) -> None:
     os.environ.setdefault("OMP_THREAD_LIMIT", "1")  # tesseract: parallelism comes from processes
     logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
@@ -106,8 +117,10 @@ def _init_worker(
         students=students,
         extra_id_labels=cfg.extra_id_labels,
     )
-    if permitted:
-        _W["scrubber"].set_permitted(PermittedNames(permitted, cfg.permitted_contacts))  # type: ignore[attr-defined]
+    if permitted or places:
+        _W["scrubber"].set_permitted(  # type: ignore[attr-defined]
+            PermittedNames(permitted or [], cfg.permitted_contacts, places or [])
+        )
 
 
 def _run_job(job: Job) -> JobResult:
@@ -384,18 +397,25 @@ def _load_permitted(
     return PermittedNames.without_students(people, KnownNameRecognizer(students))
 
 
-def _suggest_job(job: Job) -> tuple[tuple[str, ...], list[tuple[str, tuple[str, ...]]], bool]:
-    """(owners, names found, ok). A file that can't be read is skipped and counted, never fatal."""
+Found = tuple[tuple[str, ...], list[tuple[str, tuple[str, ...]]], list[tuple[str, bool]]]
+_PERSONAL_FIELDS = frozenset({"PLACE_OF_BIRTH", "STREET_ADDRESS"})
+
+
+def _suggest_job(
+    job: Job,
+) -> tuple[tuple[str, ...], list[tuple[str, tuple[str, ...]]], list[tuple[str, bool]], bool]:
+    """(owners, names, places, ok). A file that can't be read is skipped and counted, never fatal."""
     try:
-        owners, names = _suggest_names(job)
-        return owners, names, True
+        return (*_suggest_names(job), True)
     except Exception:  # noqa: BLE001 - one bad file must not end the pass
-        return job.owner_ids, [], False
+        return job.owner_ids, [], [], False
 
 
-def _suggest_names(job: Job) -> tuple[tuple[str, ...], list[tuple[str, tuple[str, ...]]]]:
-    """Full names in one document: email display names (with their addresses) and PERSON
-    entities in its existing text. No OCR, so scanned pages are not considered."""
+def _suggest_names(job: Job) -> Found:
+    """Full names and place names in one document: email display names (with their addresses)
+    and PERSON/LOCATION entities in its existing text. No OCR, so scanned pages are not
+    considered. A place is flagged personal when it sits in a labeled place-of-birth or address
+    field in this document."""
     from email import policy
     from email.parser import BytesParser
     from email.utils import getaddresses
@@ -424,7 +444,7 @@ def _suggest_names(job: Job) -> tuple[tuple[str, ...], list[tuple[str, tuple[str
             entry[1].add(email.lower())
 
     if kind in ("drop", "unsupported", "image"):
-        return job.owner_ids, []
+        return job.owner_ids, [], []
     if kind == "eml":
         msg = BytesParser(policy=policy.compat32).parsebytes(data)
         for part in msg.walk():
@@ -438,25 +458,63 @@ def _suggest_names(job: Job) -> tuple[tuple[str, ...], list[tuple[str, tuple[str
         text = ""
     results = sc.analyze(text)
     known = [(r.start, r.end) for r in results if r.entity_type == "KNOWN_STUDENT_NAME"]
+    people_spans = known + [(r.start, r.end) for r in results if r.entity_type == "PERSON"]
+    personal = [
+        (r.start, r.end)
+        for r in results
+        if r.entity_type in _PERSONAL_FIELDS
+        and (r.recognition_metadata or {}).get("recognizer_name") == "LabeledFieldRecognizer"
+    ]
+    places: dict[str, tuple[str, bool]] = {}
+
+    def hits(r: RecognizerResult, spans: list[tuple[int, int]]) -> bool:
+        return any(s < r.end and e > r.start for s, e in spans)
+
     for r in results:
-        if r.entity_type == "PERSON" and not any(s < r.end and e > r.start for s, e in known):
+        if r.entity_type == "PERSON" and not hits(r, known):
             add(text[r.start : r.end])
-    return job.owner_ids, [(surface, tuple(sorted(emails))) for surface, emails in found.values()]
+        elif r.entity_type == "LOCATION" and not hits(r, people_spans):
+            surface = candidate_place(text[r.start : r.end], noise)
+            if surface is not None:
+                prev = places.get(place_key(surface))
+                places[place_key(surface)] = (
+                    prev[0] if prev else surface,
+                    hits(r, personal) or bool(prev and prev[1]),
+                )
+    return (
+        job.owner_ids,
+        [(surface, tuple(sorted(emails))) for surface, emails in found.values()],
+        list(places.values()),
+    )
 
 
 def suggest_permitted(
-    cfg: Config, students: list[tuple[str, list[str]]], jobs: list[Job], min_people: int
+    cfg: Config,
+    students: list[tuple[str, list[str]]],
+    jobs: list[Job],
+    min_people: int,
+    min_place_share: float = 8.0,
 ) -> int:
     """Write permitted-suggestions-<time>.csv (permitted-names format plus evidence columns)
     beside the key file. Nothing is applied automatically; nothing touches the output."""
     agg: dict[frozenset[str], dict[str, object]] = {}
+    pagg: dict[str, dict[str, object]] = {}
     skipped = 0
     ctx = mp.get_context("spawn")
     with ctx.Pool(
         cfg.workers, initializer=_init_worker, initargs=(cfg, students, Mode(dry_run=True))
     ) as pool:
-        for owners, names, ok in pool.imap_unordered(_suggest_job, jobs, chunksize=4):
+        for owners, names, found_places, ok in pool.imap_unordered(_suggest_job, jobs, chunksize=4):
             skipped += not ok
+            for surface, is_personal in found_places:
+                pe = pagg.setdefault(
+                    place_key(surface), {"surfaces": Counter(), "people": set(), "personal": set(), "docs": 0}
+                )
+                pe["surfaces"][surface] += 1  # type: ignore[index]
+                pe["people"] |= set(owners)  # type: ignore[operator]
+                if is_personal:
+                    pe["personal"] |= set(owners)  # type: ignore[operator]
+                pe["docs"] += 1  # type: ignore[operator]
             for surface, addrs in names:
                 e = agg.setdefault(
                     variant_key(surface),
@@ -485,7 +543,8 @@ def suggest_permitted(
             ]
         )
     rows.sort(key=lambda r: (-int(r[4]), -int(r[5]), r[0]))
-    out = cfg.key_file.parent / f"permitted-suggestions-{dt.datetime.now():%Y%m%d-%H%M%S}.csv"
+    stamp = f"{dt.datetime.now():%Y%m%d-%H%M%S}"
+    out = cfg.key_file.parent / f"permitted-suggestions-{stamp}.csv"
     write_people(out, rows, extra_header=("evidence_students", "evidence_documents"))
     log.info(
         "suggested %d permitted name(s) seen in the files of >= %d people; review, then point "
@@ -493,6 +552,41 @@ def suggest_permitted(
         len(rows),
         min_people,
         out,
+    )
+    # Institutional places reach a large share of everyone; hometowns and countries of origin recur
+    # among a few people, so places need both thresholds.
+    min_place = max(min_people, math.ceil(min_place_share / 100 * len(students)))
+    place_rows, personal_out = [], 0
+    for pe in pagg.values():
+        ppl: set[str] = pe["people"]  # type: ignore[assignment]
+        pers: set[str] = pe["personal"]  # type: ignore[assignment]
+        if len(ppl) < min_place:
+            continue
+        if 2 * len(pers) >= len(ppl):  # mostly someone's birthplace or address: never suggested
+            personal_out += 1
+            continue
+        psurfaces: Counter[str] = pe["surfaces"]  # type: ignore[assignment]
+        place_rows.append(
+            [psurfaces.most_common(1)[0][0], "", str(len(ppl)), str(pe["docs"]), str(len(pers))]
+        )
+    place_rows.sort(key=lambda r: (-int(r[2]), -int(r[3]), r[0]))
+    pout = cfg.key_file.parent / f"permitted-places-suggestions-{stamp}.csv"
+    write_people(
+        pout,
+        place_rows,
+        extra_header=("evidence_students", "evidence_documents", "evidence_personal_students"),
+        columns=PLACE_COLUMNS,
+    )
+    log.info(
+        "suggested %d permitted place(s) seen in the files of >= %d people (%g%% of %d; %d more left "
+        "out: mostly in place-of-birth or address fields); review, then point "
+        "INKWELL_PERMITTED_PLACES_FILE at it: %s",
+        len(place_rows),
+        min_place,
+        min_place_share,
+        len(students),
+        personal_out,
+        pout,
     )
     if skipped:
         log.warning("%d file(s) could not be read and were skipped; suggestions may be incomplete", skipped)
@@ -668,6 +762,14 @@ def _parser() -> argparse.ArgumentParser:
         help="--suggest-permitted: a name must appear in the files of at least N different "
         "registry people (default 3)",
     )
+    run.add_argument(
+        "--min-place-share",
+        type=float,
+        default=8.0,
+        metavar="PCT",
+        help="--suggest-permitted: a place must also appear in the files of at least PCT%% of all "
+        "registry people (default 8)",
+    )
     sel = ap.add_argument_group("selection (WHEN: 2019-09-01, 2019-09-01T08:30, or an age: 30d, 12h, 2w)")
     sel.add_argument("--modified-after", metavar="WHEN", help="only files last modified at/after WHEN")
     sel.add_argument("--modified-before", metavar="WHEN", help="only files last modified before WHEN")
@@ -700,6 +802,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ConfigError("choose one of --dry-run, --plan-only, --audit, --suggest-permitted")
         if args.min_students < 2:
             raise ConfigError("--min-students must be at least 2")
+        if not 1 <= args.min_place_share <= 100:
+            raise ConfigError("--min-place-share must be between 1 and 100")
         if args.report and not args.dry_run:
             raise ConfigError("--report applies to --dry-run")
         window = Window(
@@ -737,6 +841,7 @@ def main(argv: list[str] | None = None) -> int:
             return audit(cfg, registry)
         students = student_table(cfg, registry)
         permitted, conflicts = _load_permitted(cfg, students)
+        places = load_places(cfg.permitted_places_file) if cfg.permitted_places_file else []
         all_jobs = plan(cfg, pmap)
         jobs = [j for j in all_jobs if window.matches(j)]
         if not (args.dry_run or args.plan_only or args.suggest_permitted):
@@ -771,7 +876,7 @@ def main(argv: list[str] | None = None) -> int:
             cfile.unlink(missing_ok=True)
 
     if args.suggest_permitted:
-        return suggest_permitted(cfg, students, jobs, args.min_students)
+        return suggest_permitted(cfg, students, jobs, args.min_students, args.min_place_share)
 
     if args.plan_only:
         from .sniff import sniff
@@ -823,7 +928,7 @@ def main(argv: list[str] | None = None) -> int:
         with ctx.Pool(
             cfg.workers,
             initializer=_init_worker,
-            initargs=(cfg, students, mode, permitted),
+            initargs=(cfg, students, mode, permitted, places),
             maxtasksperchild=200,
         ) as pool:
             for i, r in enumerate(pool.imap_unordered(_run_job, todo, chunksize=1), 1):
@@ -880,6 +985,7 @@ def main(argv: list[str] | None = None) -> int:
         "entities": dict(entities),
         "permitted_names": len(permitted),
         "permitted_conflicts": len(conflicts),
+        "permitted_places": len(places),
     }
     if args.dry_run:
         log.info("DRY RUN summary: %s", json.dumps(summary))

@@ -59,6 +59,7 @@ class Config:
     extra_name_noise: tuple[str, ...] = ()  # words in folder names that are not names
     permitted_names_file: Path | None = None  # people whose full names stay visible
     permitted_contacts: bool = False  # also keep their listed emails / phone numbers
+    permitted_places_file: Path | None = None  # institutional places that stay visible
     extra: dict[str, str] = field(default_factory=dict)
 
 
@@ -155,6 +156,15 @@ def load_config(env: dict[str, str] | None = None, *, require_output: bool = Tru
             )
         if _is_within(permitted, input_dir):
             raise ConfigError("INKWELL_PERMITTED_NAMES_FILE must be outside INKWELL_INPUT_DIR")
+    places: Path | None = None
+    if env.get("INKWELL_PERMITTED_PLACES_FILE"):
+        places = Path(env["INKWELL_PERMITTED_PLACES_FILE"]).expanduser().resolve()
+        if not places.is_file():
+            raise ConfigError("INKWELL_PERMITTED_PLACES_FILE does not exist or is not a file")
+        if _is_within(places, output_dir):
+            raise ConfigError("INKWELL_PERMITTED_PLACES_FILE must be outside INKWELL_OUTPUT_DIR")
+        if _is_within(places, input_dir):
+            raise ConfigError("INKWELL_PERMITTED_PLACES_FILE must be outside INKWELL_INPUT_DIR")
     contacts_raw = env.get("INKWELL_PERMITTED_CONTACTS", "false").strip().lower()
     if contacts_raw not in ("true", "false", "1", "0", "yes", "no"):
         raise ConfigError("INKWELL_PERMITTED_CONTACTS must be true or false")
@@ -177,4 +187,5 @@ def load_config(env: dict[str, str] | None = None, *, require_output: bool = Tru
         extra_name_noise=noise,
         permitted_names_file=permitted,
         permitted_contacts=contacts_raw in ("true", "1", "yes"),
+        permitted_places_file=places,
     )

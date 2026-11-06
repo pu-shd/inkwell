@@ -80,7 +80,7 @@ class Scrubber:
         self.permitted = PermittedNames([])
 
     def set_permitted(self, permitted: PermittedNames) -> None:
-        """People whose full names (and optionally listed contacts) stay visible."""
+        """People whose full names (and optionally listed contacts) and places that stay visible."""
         self.permitted = permitted
 
     # -- analysis -----------------------------------------------------------
@@ -111,7 +111,7 @@ class Scrubber:
         return self._mark_permitted(text, _dedupe(results))
 
     def _mark_permitted(self, text: str, results: list[RecognizerResult]) -> list[RecognizerResult]:
-        """Relabel permitted names/contacts so they are counted but never redacted.
+        """Relabel permitted names/contacts/places so they are counted but never redacted.
 
         A span that overlaps a known record subject is never permitted (the registry wins).
         Name-like results lying wholly inside a permitted name (e.g. a LOCATION on a surname)
@@ -154,8 +154,29 @@ class Scrubber:
                 r.entity_type = "PERMITTED_CONTACT"
             if r.entity_type == "LOCATION" and _inside(r, spans):
                 continue
+            if r.entity_type == "LOCATION" and clear(r.start, r.end):
+                parts = self._permitted_place_parts(text, r)
+                if parts:
+                    out.extend(parts)
+                    continue
             out.append(r)
         return _dedupe(out + extra)
+
+    def _permitted_place_parts(self, text: str, r: RecognizerResult) -> list[RecognizerResult]:
+        """A LOCATION that is (or contains, between commas/lines) a permitted place: the permitted
+        parts are relabeled PERMITTED_PLACE and the rest stays LOCATION. [] if none is permitted."""
+        if self.permitted.is_place(text[r.start : r.end]):
+            return [RecognizerResult("PERMITTED_PLACE", r.start, r.end, r.score)]
+        parts: list[RecognizerResult] = []
+        for m in re.finditer(r"[^,;\n]+", text[r.start : r.end]):
+            seg = m.group()
+            if not re.search(r"[A-Za-z]", seg):
+                continue
+            s = r.start + m.start() + (len(seg) - len(seg.lstrip()))
+            e = r.start + m.end() - (len(seg) - len(seg.rstrip()))
+            kind = "PERMITTED_PLACE" if self.permitted.is_place(text[s:e]) else "LOCATION"
+            parts.append(RecognizerResult(kind, s, e, r.score))
+        return parts if any(p.entity_type == "PERMITTED_PLACE" for p in parts) else []
 
     def _permitted_window(self, text: str, start: int, end: int) -> tuple[int, int] | None:
         """The whole span if it is a permitted name, else the first 2-4 word window inside it
@@ -308,7 +329,7 @@ def _dedupe(results: list[RecognizerResult]) -> list[RecognizerResult]:
     return out
 
 
-KEEP = frozenset({"PERMITTED_NAME", "PERMITTED_CONTACT"})
+KEEP = frozenset({"PERMITTED_NAME", "PERMITTED_CONTACT", "PERMITTED_PLACE"})
 
 
 def _inside(r: RecognizerResult, spans: Iterable[tuple[int, int]]) -> bool:

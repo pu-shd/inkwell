@@ -137,6 +137,35 @@ Ada Lovelace,"Augusta Ada King;A. Lovelace",ada@example.org,(555) 555-0100
   OCR fragments can get through); put site-specific words in `INKWELL_EXTRA_NAME_NOISE`, and
   always review the list.
 
+### Permitted places
+
+The place equivalent of permitted names: institutional place names (campus, buildings, the
+institution's town) that may stay visible, in a CSV set with `INKWELL_PERMITTED_PLACES_FILE`:
+
+```csv
+place,aliases
+Springfield,"Springfield, Ohio;Springfield OH"
+Wexford Hall,
+```
+
+* Matched against whole `LOCATION` results (case, punctuation and a leading "the" ignored), or
+  against comma/line-separated parts of one. Single words are allowed. Digits are not, so
+  street addresses and postal codes always stay redacted.
+* Only `LOCATION` results are unmasked. A place in a labeled field (place of birth, home or
+  campus address), a street-address match, or a span overlapping a record subject's name stays
+  redacted. Counted as `PERMITTED_PLACE`; the summary has `permitted_places`.
+* Trade-off: a permitted town is also visible where it is part of someone's own address outside
+  a labeled field.
+* `--suggest-permitted` also writes `permitted-places-suggestions-<time>.csv`. Recurrence alone
+  doesn't separate the institution's places from hometowns and countries of origin, which also
+  recur across people, so a place must appear in the files of at least `--min-place-share`
+  percent of all registry people (default 8, and never fewer than `--min-students`). On one
+  reviewed corpus every rejected place was below that share and the institution's places above
+  it. Form labels ("Home City"), dotted abbreviations, other institutions and subject words are
+  never suggested. A place seen in the labeled place-of-birth or address fields of half or more
+  of its people is left out (counted in the log); `evidence_personal_students` counts the rest.
+  Review the list as you would the names list.
+
 ### Selecting by date
 
 `--modified-after/--modified-before` and `--created-after/--created-before` take a date
@@ -183,7 +212,7 @@ Exit codes: `0` ok · `1` config error · `2` some files errored/leak-blocked (s
 * Handwriting and very degraded scans OCR poorly; pages flagged `low_ocr_confidence` in the
   report should be eyeballed. Unrecognized text can't be redacted.
 * `PERSON` redacts every detected name except permitted ones (see *Permitted names*).
-  `LOCATION` redacts all places.
+  `LOCATION` redacts all places except permitted ones (see *Permitted places*).
 * The withhold classifier is keyword-based. It is tuned to over-withhold (award letters
   that mention a fellowship or stipend count as financial aid in the example profile). Adjust
   `classify.py` or `INKWELL_WITHHOLD_THRESHOLD`.

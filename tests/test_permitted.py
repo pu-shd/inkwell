@@ -288,10 +288,10 @@ def test_suggest_job_skips_unreadable_file_without_failing(tmp_path: Path, scrub
     cli._W["scrubber"] = scrubber
     bad = tmp_path / "bad.pdf"
     bad.write_bytes(b"%PDF-1.4 truncated")
-    owners, names, ok = cli._suggest_job(cli.Job(str(bad), "bad.pdf", "p", 0, 0, ("S-X",)))
-    assert (owners, names) == (("S-X",), []) and ok in (True, False)
+    owners, names, places, ok = cli._suggest_job(cli.Job(str(bad), "bad.pdf", "p", 0, 0, ("S-X",)))
+    assert (owners, names, places) == (("S-X",), [], []) and ok in (True, False)
     missing = cli._suggest_job(cli.Job(str(tmp_path / "gone.pdf"), "gone.pdf", "p", 0, 0))
-    assert missing[2] is False, "unreadable files are reported, not silently ignored"
+    assert missing[3] is False, "unreadable files are reported, not silently ignored"
 
 
 # --- suggestion precision: shapes that NER reported as PERSON but are not a person's full name ---
