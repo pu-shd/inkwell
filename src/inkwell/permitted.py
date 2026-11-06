@@ -319,11 +319,25 @@ class PermittedNames:
     def without_students(
         people: Sequence[PermittedPerson], known: KnownNameRecognizer
     ) -> tuple[list[PermittedPerson], list[PermittedPerson]]:
-        """Split into (kept, conflicts): anyone whose name or alias is a registry person."""
+        """Split into (kept, conflicts): anyone whose name or alias is a registry person or contains a
+        registry person's name word. The leak check blocks any output showing such a word, so a
+        conflict stays redacted (record subjects always win)."""
         kept: list[PermittedPerson] = []
         conflicts: list[PermittedPerson] = []
         for p in people:
-            (conflicts if any(known.is_registry_full_name(n) for n in p.names()) else kept).append(p)
+            clash = any(known.is_registry_full_name(n) or known.find_any(n) for n in p.names())
+            (conflicts if clash else kept).append(p)
+        return kept, conflicts
+
+    @staticmethod
+    def places_without_students(
+        places: Sequence[PermittedPlace], known: KnownNameRecognizer
+    ) -> tuple[list[PermittedPlace], list[PermittedPlace]]:
+        """Split into (kept, conflicts): places containing a registry person's name word."""
+        kept: list[PermittedPlace] = []
+        conflicts: list[PermittedPlace] = []
+        for p in places:
+            (conflicts if any(known.find_any(n) for n in p.names()) else kept).append(p)
         return kept, conflicts
 
 

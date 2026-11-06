@@ -121,9 +121,11 @@ Ada Lovelace,"Augusta Ada King;A. Lovelace",ada@example.org,(555) 555-0100
 
 * Full names only, matched in either order and ignoring case and titles (`Dr. Ada Lovelace`,
   `Lovelace, Ada`). A lone surname or first name stays redacted.
-* Record subjects always win: an entry that is also a registry person is dropped at startup
-  (counted as `permitted_conflicts` in the summary, listed in `permitted-conflicts.csv` beside the
-  key), and any span overlapping a known subject stays redacted.
+* Record subjects always win: an entry that is a registry person, or contains one of a registry
+  person's name words (a shared first or last name), is dropped at startup (counted as
+  `permitted_conflicts` in the summary, listed in `permitted-conflicts.csv` beside the key), and
+  any span overlapping a known subject stays redacted. Otherwise the leak check would block every
+  output that shows it.
 * Only names are kept. With `INKWELL_PERMITTED_CONTACTS=true`, the listed emails and phone
   numbers of permitted people are kept too; nothing else is.
 * Kept names are counted as `PERMITTED_NAME` (and `PERMITTED_CONTACT`) in the report.
@@ -154,7 +156,8 @@ Wexford Hall,
   street addresses and postal codes always stay redacted.
 * Only `LOCATION` results are unmasked. A place in a labeled field (place of birth, home or
   campus address), a street-address match, or a span overlapping a record subject's name stays
-  redacted. Counted as `PERMITTED_PLACE`; the summary has `permitted_places`.
+  redacted. A place containing a registry person's name word is dropped at startup
+  (`permitted_place_conflicts`, listed in `permitted-place-conflicts.csv`). Counted as `PERMITTED_PLACE`; the summary has `permitted_places`.
 * Trade-off: a permitted town is also visible where it is part of someone's own address outside
   a labeled field.
 * `--suggest-permitted` also writes `permitted-places-suggestions-<time>.csv`. Recurrence alone

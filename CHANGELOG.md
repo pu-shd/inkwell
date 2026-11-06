@@ -21,6 +21,8 @@ each release is tagged `vX.Y.Z` and published on the GitHub Releases page.
   provenance, a container image on GHCR, `inkwell --version`.
 
 ### Fixed
+- A permitted name or place sharing a word with a registry person's name is now a conflict (stays
+  redacted) instead of being kept in email headers and then leak-blocking the whole file.
 - Text containing unpaired surrogates no longer crashes analysis.
 
 ## [0.1.0]
