@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup, Tag
 from openpyxl import load_workbook
 
 from .handlers import _SAFE_ATTRS as SAFE_ATTRS
+from .mathregions import mask, math_spans
 from .recognizers import KnownNameRecognizer
 from .sniff import sniff
 
@@ -88,6 +89,7 @@ def find_leaks(name: str, data: bytes, known: KnownNameRecognizer | None) -> lis
     issues: list[str] = []
     if SSN_RX.search(text) or LABELED_SSN_RX.search(text):
         issues.append("ssn_pattern")
-    if known is not None and not known.is_empty and known.find_any(text):
+    # Name words inside LaTeX math are variables (they are not redacted there either).
+    if known is not None and not known.is_empty and known.find_any(mask(text, math_spans(text))):
         issues.append("known_student_name")
     return issues

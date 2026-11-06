@@ -13,6 +13,7 @@ from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
+from .mathregions import inside, math_spans
 from .permitted import PermittedNames
 from .recognizers import KnownNameRecognizer, custom_recognizers
 
@@ -108,6 +109,9 @@ class Scrubber:
                 r.start += off
                 r.end += off
                 results.append(r)
+        spans = math_spans(text)
+        if spans:  # names/places "found" in LaTeX math are variables; strong identifiers still count
+            results = [r for r in results if r.entity_type in MATH_KEEP or not inside(r.start, r.end, spans)]
         return self._mark_permitted(text, _dedupe(results))
 
     def _mark_permitted(self, text: str, results: list[RecognizerResult]) -> list[RecognizerResult]:
@@ -248,17 +252,27 @@ class Scrubber:
         findings: Findings,
         extra_names: Iterable[str] = (),
         context_ids: Iterable[str] = (),
+        math: Sequence[bool] | None = None,
     ) -> tuple[list[int], dict[int, str]]:
         """Indexes of words to black out, plus registry-ID labels keyed by the first word of
-        each resolved known-name match (printed on the box)."""
+        each resolved known-name match (printed on the box). Words flagged in `math` (set in a math
+        font) are only blacked out for strong identifiers (MATH_KEEP)."""
         text, spans = build_text(words)
         results = self.analyze(text, extra_names)
         findings.add(results)
         hit: set[int] = set()
         labels: dict[int, str] = {}
         ctx = tuple(context_ids)
-        for r in resolve_overlaps(redactable(results)):
+        keep = redactable(results)
+        strong = resolve_overlaps([r for r in keep if r.entity_type in MATH_KEEP]) if math else []
+        for r in resolve_overlaps(keep):
             covered = [i for i, (s, e) in enumerate(spans) if s < r.end and e > r.start]
+            if math:
+                covered = [
+                    i
+                    for i in covered
+                    if not math[i] or any(x.start < spans[i][1] and x.end > spans[i][0] for x in strong)
+                ]
             hit.update(covered)
             if covered and r.entity_type == "KNOWN_STUDENT_NAME":
                 lab = self.label(r.entity_type, text[r.start : r.end], ctx, findings)
@@ -329,6 +343,8 @@ def _dedupe(results: list[RecognizerResult]) -> list[RecognizerResult]:
     return out
 
 
+# Redacted even inside LaTeX math: formats that are identifiers wherever they appear.
+MATH_KEEP = frozenset({"US_SSN", "SSN_LIKE", "EMAIL_ADDRESS", "CREDIT_CARD", "IBAN_CODE"})
 KEEP = frozenset({"PERMITTED_NAME", "PERMITTED_CONTACT", "PERMITTED_PLACE"})
 
 

@@ -27,6 +27,7 @@ from . import imaging
 from .classify import classify
 from .config import Config
 from .engine import Findings, Scrubber, Word, layer_text, redactable, resolve_overlaps
+from .mathregions import is_math_font, mostly_inside
 from .sniff import image_format, output_ext, sniff
 
 MAX_DEPTH = 3
@@ -152,21 +153,47 @@ def process(name: str, data: bytes, ctx: Ctx) -> Outcome:
 # ---------------------------------------------------------------------------
 
 
+Rect = tuple[float, float, float, float]
+
+
+def _math_font_rects(page: fitz.Page, mat: fitz.Matrix) -> list[Rect]:
+    """Image-space boxes of text set in math fonts on a page with a text layer."""
+    rects: list[Rect] = []
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if span.get("text", "").strip() and is_math_font(span.get("font", "")):
+                    r = fitz.Rect(span["bbox"]) * mat
+                    rects.append((r.x0, r.y0, r.x1, r.y1))
+    return rects
+
+
 def _redact_raster(
     img: Image.Image,
     native: Sequence[Word],
     ocr: Sequence[Word],
     ctx: Ctx,
     findings: Findings,
+    math_rects: Sequence[Rect] = (),
 ) -> tuple[Image.Image, list[Word]]:
-    """Black out PII; return the image and the words that remain visible (for a text layer)."""
+    """Black out PII; return the image and the words that remain visible (for a text layer).
+
+    Words lying in math-font areas (typeset formulas) are not redacted as names or places, and are
+    left out of the text layer: a variable spelling a record subject's name would otherwise read as
+    that name there."""
     sc = ctx.scrubber
     boxes: list[imaging.Box] = []
     labeled: list[Word] = []  # registry-ID labels printed on boxes and put in the text layer
+    rects = list(math_rects)
+
+    def in_math(w: Word) -> bool:
+        return bool(rects) and mostly_inside((w.x0, w.y0, w.x1, w.y1), rects)
+
     for source in (native, ocr):
         if not source:
             continue
-        hits, labels = sc.redact_words_labeled(source, findings, ctx.extra_names, ctx.owner_ids)
+        math = [in_math(w) for w in source] if rects else None
+        hits, labels = sc.redact_words_labeled(source, findings, ctx.extra_names, ctx.owner_ids, math=math)
         boxes += imaging.word_boxes(source, hits)
         if not labeled:  # native words win; OCR labels only for scanned pages
             labeled = [
@@ -180,7 +207,7 @@ def _redact_raster(
     out = imaging.black_out(img, boxes)
     imaging.draw_labels(out, labeled)
     layer_src = native if native else ocr
-    visible = [w for w in layer_src if not imaging.overlaps_any(w, boxes)] + labeled
+    visible = [w for w in layer_src if not imaging.overlaps_any(w, boxes) and not in_math(w)] + labeled
     return out, visible
 
 
@@ -225,21 +252,23 @@ def handle_pdf(data: bytes, ctx: Ctx) -> Outcome:
     if src.needs_pass and not src.authenticate(""):
         return Outcome("unsupported", "pdf", notes=["encrypted"])
     scale = cfg.dpi / 72.0
-    pages: list[tuple[int, list[Word], list[Word]]] = []
+    pages: list[tuple[int, list[Word], list[Word], list[Rect]]] = []
     texts: list[str] = []
     low_conf_pages = 0
     for page in src:
         img, rot = _render(page, cfg.dpi)
         native: list[Word] = []
+        math_rects: list[Rect] = []
         if rot == 0:
             mat = page.rotation_matrix * fitz.Matrix(scale, scale)
             for x0, y0, x1, y1, txt, b, ln, _ in page.get_text("words"):
                 r = fitz.Rect(x0, y0, x1, y1) * mat
                 native.append(Word(txt, r.x0, r.y0, r.x1, r.y1, (int(b), int(ln))))
+            math_rects = _math_font_rects(page, mat)
         ocr, conf = imaging.ocr_words(img, cfg.tesseract_lang)
         if not native and 0 <= conf < 60:
             low_conf_pages += 1
-        pages.append((rot, native, ocr))
+        pages.append((rot, native, ocr, math_rects))
         texts.append(" ".join(w.text for w in native) + "\n" + " ".join(w.text for w in ocr))
     # Withholding is decided per page: scanned case files mix protected records
     # letters with correspondence, and one flagged page must not empty the whole file.
@@ -256,7 +285,9 @@ def handle_pdf(data: bytes, ctx: Ctx) -> Outcome:
         return _copied("pdf", data, ".pdf")
 
     out = fitz.open()
-    for i, (page, (rot, native, ocr), verdict) in enumerate(zip(src, pages, verdicts, strict=True)):
+    for i, (page, (rot, native, ocr, math_rects), verdict) in enumerate(
+        zip(src, pages, verdicts, strict=True)
+    ):
         if verdict.withhold and verdict.category:
             _add_withheld_page(out, page.rect, verdict.category)
             continue
@@ -264,7 +295,7 @@ def handle_pdf(data: bytes, ctx: Ctx) -> Outcome:
             out.insert_pdf(src, from_page=i, to_page=i)  # original page, untouched
             continue
         img, _ = _render(page, cfg.dpi, force_rot=rot)
-        red, visible = _redact_raster(img, native, ocr, ctx, findings)
+        red, visible = _redact_raster(img, native, ocr, ctx, findings, math_rects)
         _add_page(out, red, visible, ctx)
     if ctx.redact:
         out.set_metadata({})
