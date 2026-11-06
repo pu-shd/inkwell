@@ -141,8 +141,10 @@ def candidate_name(text: str, noise: frozenset[str] = frozenset()) -> str | None
     while titled and _plain(titled[0]) in _TITLES:
         titled = titled[1:]
     for cand in (titled, tokens):  # "Dean J. Roe": Dean is the first name, not a title
-        if _full_name_shape(_shape(cand, noise), len(cand)):
-            return " ".join(cand)
+        name = " ".join(cand)
+        # The loader's rule too, so every suggestion is usable as is ("Dean Roe" is not).
+        if _full_name_shape(_shape(cand, noise), len(cand)) and len(name_key(name)) >= 2:
+            return name
     return None
 
 

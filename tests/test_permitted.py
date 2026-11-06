@@ -339,6 +339,9 @@ NOT_NAMES = [
     "C. Babbage A. Lovelace",
     "Ada Lovelace A. B.",
     "Please List Two Contacts.",
+    "Dean Lovelace",  # title + surname: not a full name, and the loader would refuse it
+    "Prof. Lovelace",
+    "Ms Lovelace",
 ]
 NOT_NAMES.remove("Dear Ada Lovelace")
 KEEP = {
@@ -377,6 +380,19 @@ def test_candidate_keeps_full_names(text: str, clean: str) -> None:
     from inkwell.permitted import candidate_name
 
     assert candidate_name(text) == clean
+
+
+def test_every_candidate_is_loadable(tmp_path: Path) -> None:
+    # Suggestions must pass the loader's own full-name rule, or the file can't be used as is.
+    from inkwell.permitted import candidate_name, name_key
+
+    for text in [*NOT_NAMES, *KEEP]:
+        got = candidate_name(text)
+        if got is not None:
+            assert len(name_key(got)) >= 2, got
+    kept = [candidate_name(t) for t in KEEP]
+    path = _write(tmp_path / "p.csv", "".join(f"{k},,,\n" for k in kept if k))
+    assert len(load_permitted(path)) == len(KEEP)
 
 
 def test_candidate_extra_noise_words() -> None:
