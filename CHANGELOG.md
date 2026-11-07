@@ -5,6 +5,8 @@ each release is tagged `vX.Y.Z` and published on the GitHub Releases page.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-06
+
 ### Added
 - Permitted names (#2): `INKWELL_PERMITTED_NAMES_FILE` keeps listed people's full names visible;
   `INKWELL_PERMITTED_CONTACTS` optionally keeps their listed emails and phone numbers;
