@@ -1,7 +1,7 @@
-"""inkwell command line: walk the input tree, scrub in parallel, write a PII-free report.
+"""inkwell: scrub a records folder into a redacted, pseudonymized copy.
 
-Exit codes: 0 ok, 1 config/startup error, 2 some files errored or failed the leak check,
-3 nothing was processed / selected (silence is not success).
+Exit codes: 0 ok, 1 config error, 2 some files errored or were leak-blocked, 3 nothing selected,
+130 stopped.
 """
 
 from __future__ import annotations
@@ -767,83 +767,72 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--dry-run",
         action="store_true",
-        help="full simulation (OCR, classification, redaction, leak check) that writes "
-        "nothing to the output, key or registry; reports what each file would get",
+        help="do everything but write only a report of what each file would get",
     )
     run.add_argument(
         "--report",
         metavar="PATH",
-        help="dry-run report location (default: dryrun-<time>.csv beside the key file). "
-        "It lists ORIGINAL paths, so it must be outside the input and output folders",
+        help="dry-run report path (default: the key folder); must be outside input and output",
     )
     run.add_argument(
         "--plan-only",
         action="store_true",
-        help="fast: count selected files per detected type; no processing, nothing written",
+        help="count the selected files by type; writes nothing",
     )
     run.add_argument(
         "--audit",
         action="store_true",
-        help="re-run the leak check over existing outputs; delete failures and images so "
-        "the next run reprocesses them (use after a recognizer fix)",
+        help="re-check existing outputs; delete failures (and images) so the next run redoes them",
     )
     run.add_argument(
         "--suggest-permitted",
         action="store_true",
-        help="draft a permitted-names list from full names that recur across many people's files "
-        "(email display names and existing text, no OCR); written beside the key for review",
+        help="draft permitted names and places lists in the key folder, for review",
     )
     run.add_argument(
         "--min-students",
         type=int,
         default=3,
         metavar="N",
-        help="--suggest-permitted: a name must appear in the files of at least N different "
-        "registry people (default 3)",
+        help="suggested names appear in at least N people's files (default 3)",
     )
     run.add_argument(
         "--min-place-share",
         type=float,
         default=8.0,
         metavar="PCT",
-        help="--suggest-permitted: a place must also appear in the files of at least PCT%% of all "
-        "registry people (default 8)",
+        help="suggested places appear in at least PCT%% of people's files (default 8)",
     )
-    ctl = ap.add_argument_group(
-        "control a running inkwell from another terminal (an interrupted run resumes by running "
-        "the same command again)"
-    )
-    ctl.add_argument("--pause", action="store_true", help="freeze the running inkwell (all its processes)")
+    ctl = ap.add_argument_group("control a running inkwell (rerun the same command to resume after a stop)")
+    ctl.add_argument("--pause", action="store_true", help="pause the running inkwell")
     ctl.add_argument("--resume", action="store_true", help="continue a paused run")
     ctl.add_argument(
         "--stop",
         action="store_true",
-        help="stop the running inkwell cleanly: it saves progress, removes partial files and exits; "
-        "run the same command again to resume",
+        help="stop cleanly, saving progress",
     )
     sel = ap.add_argument_group("selection (WHEN: 2019-09-01, 2019-09-01T08:30, or an age: 30d, 12h, 2w)")
-    sel.add_argument("--modified-after", metavar="WHEN", help="only files last modified at/after WHEN")
-    sel.add_argument("--modified-before", metavar="WHEN", help="only files last modified before WHEN")
-    sel.add_argument("--created-after", metavar="WHEN", help="only files created at/after WHEN (macOS)")
-    sel.add_argument("--created-before", metavar="WHEN", help="only files created before WHEN (macOS)")
+    sel.add_argument("--modified-after", metavar="WHEN", help="modified at or after WHEN")
+    sel.add_argument("--modified-before", metavar="WHEN", help="modified before WHEN")
+    sel.add_argument("--created-after", metavar="WHEN", help="created at or after WHEN (macOS)")
+    sel.add_argument("--created-before", metavar="WHEN", help="created before WHEN (macOS)")
     sel.add_argument(
         "--folders",
         metavar="FILE",
-        help="only these top-level input folders, one name per line (# comments allowed); combines "
-        "with the date flags. Keep the file outside the output folder",
+        help="only the top-level folders listed in FILE, one per line; combines with dates",
     )
-    sel.add_argument("--limit", type=int, default=0, help="process at most N selected files")
-    sel.add_argument("--force", action="store_true", help="reprocess files already scrubbed")
-    beh = ap.add_argument_group("behavior (each one alone is weaker; the run warns about its output)")
+    sel.add_argument("--limit", type=int, default=0, metavar="N", help="at most N files")
+    sel.add_argument("--force", action="store_true", help="redo files already done")
+    beh = ap.add_argument_group("reduced modes (the run warns about its output)")
     beh.add_argument(
         "--no-redact",
         action="store_true",
-        help="don't redact: non-withheld documents are copied unchanged (output keeps PII)",
+        help="copy non-withheld files unchanged (output keeps PII)",
     )
     beh.add_argument(
         "--no-withhold",
         action="store_true",
-        help="don't withhold protected records: redact them and flag them in the report",
+        help="redact protected records instead of withholding them",
     )
     return ap
 

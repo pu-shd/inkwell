@@ -1,272 +1,244 @@
 # inkwell
 
-Presidio-based scrubber for sensitive records. It reads a records folder **read-only** and
-writes a scrubbed, pseudonymized copy, preserving file and folder modification times.
+Scrubs a folder of sensitive records. It reads the input **read-only** and writes a redacted,
+pseudonymized copy with the original modification times. A separate key folder links the copy back
+to people.
 
-## What it removes
+## Quick start
 
-| Kind | How |
-|---|---|
-| SSNs and ID numbers | Presidio `US_SSN` + custom `SSN_LIKE` (any `###-##-####`, valid or not), 9-digit IDs, labeled fields (`SSN:`, `ID number`, `EMPLID`, plus `INKWELL_EXTRA_ID_LABELS`) incl. value on the next OCR line |
-| Biometric data | Faces in images/scans blacked out (OpenCV); documents about fingerprints/biometrics withheld |
-| DOB, place of birth, mother's maiden name | Labeled-field recognizer (`Date of Birth`, `DOB`, `born in`, `Place of Birth`, `Maiden Name`, `née`) |
-| Names & addresses of record subjects and their families | Presidio `PERSON`/`LOCATION`, street/PO box/ZIP patterns, labeled fields (`Father's name`, `Parent/Guardian`, `Home address`…), **every subject name harvested from the folder names**, and display names from each email's headers |
-| Protected record types | Document classifier (`classify.py`) with a withholding profile; matching documents (PDFs: pages) are **withheld** and replaced by a placeholder. The built-in example profile covers education records: grades, transcripts, schedules, disciplinary files, financial aid and special-education plans |
-| Also | email addresses, phone numbers, passport/bank/card numbers, SEVIS IDs/A-numbers; PDF/Office metadata, EXIF, email routing headers, HTML scripts/comments |
+```zsh
+scripts/setup.sh                  # .venv with locked dependencies; creates .env from example.env
+$EDITOR .env                      # input, output and key paths (see example.env)
+scripts/run.sh --plan-only        # file counts for the selection; writes nothing
+scripts/run.sh --dry-run          # full simulation; writes only a private report
+scripts/run.sh                    # the real run; re-run to continue or to add new files
+```
 
-## Output
+Other scripts: `scripts/docker-run.sh` (the same run in a network-isolated container),
+`scripts/test.sh` (lint, types and tests in Docker; `--local` uses `.venv`).
 
-* PDFs (text or scanned) are rendered at `INKWELL_DPI`, OCR'd (Tesseract, with orientation
-  detection), black-boxed and **flattened**: nothing under a box survives. An invisible text
-  layer of the *remaining* words keeps them searchable.
-* Images: same OCR + box + face pipeline, re-encoded in the original format.
-* `.eml`: bodies redacted (`<PERSON>`, `<US_SSN>`…), address headers replaced, attachments
-  recursively scrubbed and renamed. `.docx`/`.xlsx`/`.html`/`.txt`/`.zip` are scrubbed in place
-  in their own formats (spreadsheet columns with PII headers are blanked wholesale).
-* Paths: `Cohort 2019-20/<Person>/<file>` → `Cohort 2019-20/S-7KQ2M9XHC/D-4TB8R2NW6KQ.pdf`. Top-level
-  group folders matching `INKWELL_GROUP_DIR_REGEX` (default: names ending in a year range such as
-  `2019-20`) are kept; each folder below one is treated as one record subject.
-* Withholding is **per page** for PDFs: flagged pages become a `WITHHELD` placeholder page;
-  a PDF whose every page is flagged (and any flagged email/Office file) is withheld whole.
-* Dropped (never copied): `.js .css .svg .download`, `.DS_Store`, `Thumbs.db`.
-  Unsupported (`.doc`, encrypted PDFs) and failed files are **not written** — fail closed.
-* `_inkwell_report.csv` / `_inkwell_summary.json` in the output: per-file status, category,
-  entity counts. Pseudonymous paths only, never values.
-* **Leak check**: every output is re-read; any residual SSN pattern or known subject name blocks
-  the file (`leak_blocked`) instead of writing it.
-
-## Identifiers and re-identification
-
-Everything that links output back to people lives in `INKWELL_KEY_FILE`'s directory
-(mode 700, files 600, required to be outside both input and output):
-
-| File | One row per | Columns |
-|---|---|---|
-| `registry.csv` | **record subject** | `student_id`, `canonical_name`, `aliases`, `class_years`, `folders`, `institution_id`, `needs_review` |
-| `key.csv` | file / dir / zip member / attachment | `original_path`, `pseudonym_path`, `student_ids` (owners), `mentions`, `sha256_original`, `sha256_output` |
-
-(Column and entity names such as `student_id` and `KNOWN_STUDENT_NAME` come from the built-in
-example profile; they hold any record subject.)
-
-* **Random IDs.** `S-` subjects, `D-` documents, `F-` other folders: cryptographically random
-  Crockford base32 with a check character (`ids.is_valid`). They carry no ordering, so they
-  can't be matched to an alphabetical list of names.
-* **Person, not folder.** The registry merges a person's folders across group folders
-  (flagged `needs_review` in case two people share a name) and attaches loose top-level
-  zips/folders named after them. `canonical_name`, `aliases` and `institution_id` may be edited by
-  hand; edits survive re-runs, and new aliases are used for matching and in-text linking.
-* **Fingerprints.** SHA-256 of each original and output. A renamed or moved original keeps its
-  document ID (identical copies that both exist get separate IDs); `sha256_output` verifies a
-  scrubbed file came from its original.
-* **In-text pseudonyms.** A known subject's name becomes `<S-…>` in text formats; on scans the ID
-  is printed white on the black box and added to the text layer. Partial names ("Ms. Roe")
-  resolve only when unambiguous or when exactly one candidate owns the document; otherwise
-  `<KNOWN_STUDENT_NAME>`. Every document's resolved names are listed in `key.csv` `mentions`.
-  Trade-off: anyone holding the output can link one person's documents to each other (not to
-  the person), which also makes the output somewhat easier to re-identify from context.
-
-Reassociating: find the person in `registry.csv` → `student_id` → output folder
-`*/S-…/` plus every `key.csv` row whose `student_ids` or `mentions` contains it.
-Destroying the key directory makes the output non-reidentifiable by these files.
-
-## Install
-
-From a release (needs Python 3.12 and Tesseract; the spaCy model, about 0.6 GB, comes with it):
+To install a release instead of using a clone (needs Python 3.12 and Tesseract):
 
 ```zsh
 brew install tesseract uv
 uv tool install https://github.com/pu-shd/inkwell/releases/download/vX.Y.Z/inkwell-X.Y.Z-py3-none-any.whl
-inkwell --version
 ```
 
-Each release also has the sdist, `SHA256SUMS` and build-provenance attestations
-(`gh attestation verify <file> -R pu-shd/inkwell`), and a container image
-`ghcr.io/pu-shd/inkwell:vX.Y.Z` (Tesseract included; run it network-isolated, as
-`scripts/docker-run.sh` does). Configuration is read from `INKWELL_*` environment variables
-(see `example.env`). From a clone, use `scripts/setup.sh` instead.
+Each release also ships `SHA256SUMS`, provenance attestations
+(`gh attestation verify <file> -R pu-shd/inkwell`) and the image `ghcr.io/pu-shd/inkwell:vX.Y.Z`.
 
-## Usage
+## What it does
+
+- **Redacts**:
+  - SSNs and other ID numbers, including labeled ones (`SSN:`, `EMPLID`, plus
+    `INKWELL_EXTRA_ID_LABELS`);
+  - names, addresses, emails, phone numbers, dates and places of birth, maiden names;
+  - passport, bank and card numbers;
+  - faces in images;
+  - metadata, EXIF data, email routing headers and HTML scripts.
+- **Names of record subjects**:
+  - Every name taken from the folder names is redacted wherever it appears.
+  - In text formats it becomes the person's ID (`<S-…>`).
+  - On scans, the ID is printed on the black box.
+- **Withholds**:
+  - A keyword classifier withholds protected record types.
+  - The built-in profile covers grades, transcripts, financial aid, discipline and similar
+    records.
+  - In PDFs, only the flagged pages become a `WITHHELD` placeholder.
+  - Any other flagged file is withheld whole.
+- **PDFs and images**:
+  - Each page is rendered, read with OCR (Tesseract), black-boxed and **flattened**, so nothing
+    survives under a box.
+  - The words that remain stay searchable through an invisible text layer.
+- **Other formats**: email, Office, HTML, text and zip files are scrubbed in their own format.
+  Email attachments and zip members are scrubbed the same way.
+- **Fails closed**:
+  - Every output is re-read before it is written.
+  - A file with a residual SSN or subject name is not written; it is reported as `leak_blocked`.
+  - Unsupported files (`.doc`, encrypted PDFs) and failed files are never written either.
+- **Dropped**: web and system junk is never copied (`.js`, `.css`, `.svg`, fonts, `.DS_Store`,
+  `Thumbs.db`, `._*` files).
+- **Math**:
+  - LaTeX math in text formats and math-font text in PDFs is left alone.
+  - SSNs, emails and card numbers inside math are still redacted.
+  - Formulas on scans are treated as ordinary text.
+
+**Paths** are pseudonymized:
+
+```
+Cohort 2019-20/<Person>/<file>  →  Cohort 2019-20/S-7KQ2M9XHC/D-4TB8R2NW6KQ.pdf
+```
+
+- Top-level folders matching `INKWELL_GROUP_DIR_REGEX` keep their names. The default matches
+  names that end in a year range such as `2019-20`.
+- Each folder below one of those is treated as one person.
+- IDs are random, carry no ordering and include a check character.
+
+**Reports** in the output folder show pseudonymous paths only:
+- `_inkwell_report.csv` holds every file's history across runs.
+- `_inkwell_summary.json` covers the latest run only.
+
+## The key folder
+
+The key folder is the directory of `INKWELL_KEY_FILE`. It must be outside the input and output
+folders; it has mode 700 and its files mode 600.
+
+| File | Contents |
+|---|---|
+| `registry.csv` | One row per person: ID, name, aliases, class years, folders, institution ID, `needs_review` |
+| `key.csv` | One row per file, folder or attachment: original path, pseudonym path, owners, names mentioned, input and output SHA-256 |
+
+**Re-identifying a document:**
+1. Find the person in `registry.csv`.
+2. Use their ID to find the `*/S-…/` folder and every `key.csv` row that lists the ID.
+
+**About the registry:**
+- A person's folders are merged across years. A possible name clash is flagged `needs_review`.
+- You can edit names, aliases and institution IDs by hand; the edits survive re-runs.
+
+**About privacy:**
+- Destroy the key folder and the output can't be re-identified from these files.
+- Even without the key, anyone holding the output can tell which documents belong to the same
+  person.
+
+## Choosing files
+
+| Flag | Selects |
+|---|---|
+| `--modified-before WHEN`, `--modified-after WHEN` | files by modification time |
+| `--created-before WHEN`, `--created-after WHEN` | files by birth time on this disk; macOS only, refused on Linux |
+| `--folders FILE` | top-level folders listed in FILE, one per line, `#` comments allowed |
+| `--limit N` | at most N files (for a pilot) |
+| `--force` | files already done, again |
+
+- **`WHEN`** is a date (`2019-09-01`), a local time (`2019-09-01T08:30`) or an age (`30d`, `12h`,
+  `2w`).
+- **Date boundaries:** *after* includes the date given; *before* excludes it.
+- **Combining:** flags combine with AND.
+
+**Old folders with recent dates.** Folders whose file dates don't show the records' age (for
+example, old records copied recently) are picked up by a second run with `--folders` into the same
+output:
 
 ```zsh
-scripts/setup.sh                  # .venv + locked deps, creates .env from example.env
-$EDITOR .env
-scripts/run.sh --plan-only        # fast: counts by type for the selection, writes nothing
-scripts/run.sh --dry-run          # full simulation, writes only a private report (see below)
-scripts/run.sh --limit 50         # pilot
-scripts/run.sh                    # full run; re-runnable, skips finished files (--force to redo)
-scripts/run.sh --pause            # from another terminal: pause / --resume / --stop (see below)
-scripts/run.sh --audit            # after a recognizer fix: re-check existing outputs, delete any
-                                  # that fail (plus images), then run again to redo just those
-scripts/docker-run.sh             # same, in a network-isolated container
-scripts/test.sh                   # lint + mypy + tests in Docker (CI); --local for .venv
+scripts/run.sh --modified-before 2020-11-06
+scripts/run.sh --folders ~/Documents/inkwell-key/old-folders.txt
 ```
 
-### Site-specific settings
+**Rules for the folder list:**
+- Keep the file outside the output folder.
+- Errors name the line number, not the folder.
 
-| Variable | Purpose | Example |
-|---|---|---|
-| `INKWELL_GROUP_DIR_REGEX` | top-level grouping folders; one capturing group = year label | `^Cohort (\d{4}-\d{2})$` |
-| `INKWELL_EXTRA_ID_LABELS` | extra form labels that precede an ID number | `XUID,Member ID` |
-| `INKWELL_EXTRA_NAME_NOISE` | words in folder names that are not names (codes, departments) | `msc,ba` |
+## Permitted names and places
 
-### Permitted names
-
-Names of people who may stay visible (staff, officials, signatories…) go in a CSV beside the
-key file, set with `INKWELL_PERMITTED_NAMES_FILE`:
+Names of staff and officials, and the institution's own places, can stay visible. List them in
+CSVs in the key folder:
 
 ```csv
 name,aliases,emails,phones
 Ada Lovelace,"Augusta Ada King;A. Lovelace",ada@example.org,(555) 555-0100
 ```
-
-* Full names only, matched in either order and ignoring case and titles (`Dr. Ada Lovelace`,
-  `Lovelace, Ada`). A lone surname or first name stays redacted.
-* Record subjects always win: an entry that is a registry person, or contains one of a registry
-  person's name words (a shared first or last name), is dropped at startup (counted as
-  `permitted_conflicts` in the summary, listed in `permitted-conflicts.csv` beside the key), and
-  any span overlapping a known subject stays redacted. Otherwise the leak check would block every
-  output that shows it.
-* Only names are kept. With `INKWELL_PERMITTED_CONTACTS=true`, the listed emails and phone
-  numbers of permitted people are kept too; nothing else is.
-* Kept names are counted as `PERMITTED_NAME` (and `PERMITTED_CONTACT`) in the report.
-* `--suggest-permitted [--min-students N]` drafts a list from full names that appear in the
-  files of at least N different registry people (default 3), from email display names and the
-  text already in each document (no OCR). It writes `permitted-suggestions-<time>.csv` beside
-  the key, in the same format plus evidence columns, and applies nothing. Review it, delete rows,
-  then point `INKWELL_PERMITTED_NAMES_FILE` at it.
-* Suggestions are only name-shaped text: at least two full words, no form labels, degrees,
-  markup, garbled encodings, initials-only forms, salutations or citations. Variants differing only
-  in initials share one row. Detection is still imprecise (streets, buildings, product names and
-  OCR fragments can get through); put site-specific words in `INKWELL_EXTRA_NAME_NOISE`, and
-  always review the list.
-
-### Permitted places
-
-The place equivalent of permitted names: institutional place names (campus, buildings, the
-institution's town) that may stay visible, in a CSV set with `INKWELL_PERMITTED_PLACES_FILE`:
-
 ```csv
 place,aliases
-Springfield,"Springfield, Ohio;Springfield OH"
-Wexford Hall,
+Springfield,"Springfield, Ohio"
 ```
 
-* Matched against whole `LOCATION` results (case, punctuation and a leading "the" ignored), or
-  against comma/line-separated parts of one. Single words are allowed. Digits are not, so
-  street addresses and postal codes always stay redacted.
-* Only `LOCATION` results are unmasked. A place in a labeled field (place of birth, home or
-  campus address), a street-address match, or a span overlapping a record subject's name stays
-  redacted. A place containing a registry person's name word is dropped at startup
-  (`permitted_place_conflicts`, listed in `permitted-place-conflicts.csv`). Counted as `PERMITTED_PLACE`; the summary has `permitted_places`.
-* Trade-off: a permitted town is also visible where it is part of someone's own address outside
-  a labeled field.
-* `--suggest-permitted` also writes `permitted-places-suggestions-<time>.csv`. Recurrence alone
-  doesn't separate the institution's places from hometowns and countries of origin, which also
-  recur across people, so a place must appear in the files of at least `--min-place-share`
-  percent of all registry people (default 8, and never fewer than `--min-students`). On one
-  reviewed corpus every rejected place was below that share and the institution's places above
-  it. Form labels ("Home City"), dotted abbreviations, other institutions and subject words are
-  never suggested. A place seen in the labeled place-of-birth or address fields of half or more
-  of its people is left out (counted in the log); `evidence_personal_students` counts the rest.
-  Review the list as you would the names list.
+Then point the settings at them:
+- **Names:** set `INKWELL_PERMITTED_NAMES_FILE`.
+  - Full names are matched in any order, ignoring case and titles.
+  - A first name or surname on its own stays redacted.
+  - Emails and phone numbers stay visible only if `INKWELL_PERMITTED_CONTACTS=true`.
+- **Places:** set `INKWELL_PERMITTED_PLACES_FILE`.
+  - Only detected locations are affected.
+  - Entries can't contain digits, so street addresses and postal codes stay redacted.
+  - Birthplace and address fields stay redacted.
+  - A permitted town still shows when it appears in someone's address outside a labeled field.
+- **Record subjects always win.** An entry that shares a word with any registry person's name is
+  dropped at startup. Dropped entries are listed in `permitted-conflicts.csv` and
+  `permitted-place-conflicts.csv`.
 
-### Selecting by date
+**Drafting the lists.** `scripts/run.sh --suggest-permitted` writes two drafts to the key folder:
+`permitted-suggestions-<time>.csv` and `permitted-places-suggestions-<time>.csv`.
 
-`--modified-after/--modified-before` and `--created-after/--created-before` take a date
-(`2019-09-01`), a local date-time (`2019-09-01T08:30`) or an age (`30d`, `12h`, `2w`). *After* is
-inclusive, *before* exclusive; flags combine. Creation time is the file's birth time on this disk
-(when it was downloaded/copied here, not when the document was written) and exists only on
-macOS/BSD: in Docker/Linux `--created-*` stops with an error rather than matching nothing.
+- **Names:** full names found in the files of at least `--min-students` people (default 3).
+- **Places:** places found in the files of at least `--min-place-share`% of all people (default
+  8). Hometowns recur too, so this threshold is higher.
+- **Not suggested:**
+  - form labels, initials-only names and abbreviations;
+  - places that appear mostly in birthplace or address fields.
+- **Always review the drafts.** Detection is imprecise, and streets, buildings and OCR fragments
+  slip through. Add recurring junk words to `INKWELL_EXTRA_NAME_NOISE`.
 
-### Selecting folders
+## Running
 
-`--folders FILE` limits a run to the top-level input folders named in FILE, one per line (blank
-lines and `#` comments ignored; loose top-level files are not in any folder, so they are left out).
-Alone it ignores dates; with date flags both must match. Use it for folders whose file dates don't
-reflect the records' age (e.g. old records scanned or copied recently), typically as a second run
-into the same output:
+**Dry run:**
+- `--dry-run` does all the work but writes only `dryrun-<time>.csv` to the key folder (or
+  `--report PATH`).
+- The report lists **original paths**, so it is refused inside the input or output folder.
+- It takes as long as a real run.
 
-```zsh
-scripts/run.sh --modified-before 2020-11-06      # by file date
-scripts/run.sh --folders ~/Documents/inkwell-key/old-classes.txt   # plus these folders, any date
-```
-
-Bad lines are reported by line number only, since folder names can contain names; keep the file
-outside the output folder.
-
-### Dry run
-
-`--dry-run` does everything a real run does (OCR, classification, per-page withholding,
-redaction, leak check) but writes nothing to the output folder, key or registry. It writes one
-CSV, `dryrun-<time>.csv` beside the key file (or `--report PATH`), mode 600, with
-`original_path, pseudonym_path, pseudonym_is_new, kind, would_status, category, entities,
-notes, modified, created`. It lists **original paths** (which contain names), so it is refused
-inside the input or output folder. Values are never written. It takes as long as a real run.
-
-### Pausing, stopping and resuming
+**Pause, stop and resume:**
 
 | To | Do |
 |---|---|
-| pause for a while (keeps everything in memory) | `scripts/run.sh --pause` from another terminal, or Ctrl-Z in the run's terminal |
-| continue a paused run | `scripts/run.sh --resume` (or `fg` after Ctrl-Z) |
-| stop (e.g. before a restart) | Ctrl-C, or `scripts/run.sh --stop` from another terminal |
-| continue after a stop, crash or power loss | run the same command again |
+| pause | `scripts/run.sh --pause` from another terminal, or Ctrl-Z |
+| continue a paused run | `scripts/run.sh --resume`, or `fg` |
+| stop | `scripts/run.sh --stop`, or Ctrl-C (saves progress, exits with code 130) |
+| continue after a stop or crash | run the same command again |
 
-A stopped run saves every finished file's key data, removes half-written files and exits with
-code `130`. A rerun skips files whose output exists **and** whose result is in the key, so a file
-that was written but not yet recorded is simply redone. Only one run at a time may use a key
-folder (`inkwell.lock` there; a lock left by a crash is taken over). A dry run can be paused but not
-resumed after a stop: its report only means something as one complete pass. Sleep is safe: work
-continues on wake (`scripts/run.sh` keeps the Mac from idle-sleeping while it runs).
+- **What counts as done:** a file is skipped only if its output exists **and** its key row is
+  saved. Anything else is redone.
+- **One run at a time:** only one run can use a key folder (`inkwell.lock`).
+- **Sleep:** sleep is safe; `run.sh` keeps the Mac awake while it works.
 
-### Redaction and withholding switches
+**After a recognizer fix:** `--audit` re-checks existing outputs and deletes failures and images.
+The next run redoes just those files.
 
-| Flags | Withheld records | Everything else | Warning |
-|---|---|---|---|
-| *(default)* | placeholder | redacted, leak-checked | — |
-| `--no-withhold` | redacted, readable, noted `flagged:<category>` | redacted, leak-checked | `WITHHOLDING DISABLED` |
-| `--no-redact` | placeholder | **copied unchanged** (status `copied`, no leak check) | `REDACTION DISABLED` |
-| both | refused | | |
+**Reduced modes:**
 
-The warning is logged at start and end and written to `_inkwell_WARNING.txt` in the output.
-An output folder holds one mode (`_inkwell_mode.json`); switching modes against an existing
-output requires `--force` without `--limit` or date filters (or a new `INKWELL_OUTPUT_DIR`).
+| Flags | Effect |
+|---|---|
+| `--no-withhold` | Protected records are redacted, not withheld, and flagged in the report. |
+| `--no-redact` | Non-withheld files are copied **unchanged**. |
 
-Exit codes: `0` ok · `1` config error · `2` some files errored/leak-blocked (see report) ·
-`3` no input / nothing selected.
+- **Warnings:** either mode writes `_inkwell_WARNING.txt`.
+- **No mixing:** an output folder keeps one mode; switching needs `--force` on a full run.
+- **Not both:** the two flags can't be combined.
 
-### Releasing
+**Exit codes:**
 
-1. `uv version X.Y.Z`; rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z]`; merge to `main`.
-2. `scripts/release.sh --dry-run X.Y.Z` runs every check, the Docker test suite and a local build.
-3. `scripts/release.sh X.Y.Z` does the same, then pushes tag `vX.Y.Z`. The `release` workflow
-   tests, builds, checks the distributions (`scripts/check_dist.py` allows only listed files),
-   installs the wheel into a clean environment, and publishes the GitHub release and image.
+| Code | Meaning |
+|---|---|
+| `0` | ok |
+| `1` | configuration error |
+| `2` | some files errored or were leak-blocked (see the report) |
+| `3` | nothing selected |
+| `130` | stopped |
 
-### Math
+## Settings
 
-Math is not a redaction target: names and places "found" in formulas are variables and operators.
+All settings are `INKWELL_*` environment variables. `example.env` lists every one with a short
+comment.
 
-* Text formats (email, HTML, Office, text): LaTeX math regions (`$…$`, `$$…$$`, `\(…\)`,
-  `\[…\]`, `equation`/`align`-style environments) are left as they are. A region must contain a
-  TeX command (`\frac`, `\alpha`…) or be a tiny `$x$`: operators alone don't count, because scripts
-  and templates in saved pages put `$`, braces and `=` around whole sentences. Inline `$…$` follows
-  the TeX-in-text rule (no space just inside the delimiters, no digit right after the closing `$`;
-  it may wrap a line but not cross a blank line), so dollar amounts are not math. A region with two
-  adjacent capitalized words (`\text{Jane Roe}`) or five ordinary words in a row is prose.
-* PDFs with a text layer: words typeset in math fonts (Computer Modern/AMS/Euler math, OpenType
-  math fonts…) stay visible, and are left out of the invisible text layer. A detection that spans
-  math and ordinary words still boxes the ordinary words.
-* SSNs, email addresses and card numbers are redacted even inside math. Scanned pages have no
-  fonts, so formulas there are treated like any other text.
+**Site-specific settings:**
+- `INKWELL_GROUP_DIR_REGEX`: which top-level folders keep their names (year groups).
+- `INKWELL_EXTRA_ID_LABELS`: extra labels that come before an ID.
+- `INKWELL_EXTRA_NAME_NOISE`: words in folder names that are not names.
 
-## Limits — human review still required
+## Limits: a person still needs to review
 
-* Handwriting and very degraded scans OCR poorly; pages flagged `low_ocr_confidence` in the
-  report should be eyeballed. Unrecognized text can't be redacted.
-* `PERSON` redacts every detected name except permitted ones (see *Permitted names*).
-  `LOCATION` redacts all places except permitted ones (see *Permitted places*).
-* The withhold classifier is keyword-based. It is tuned to over-withhold (award letters
-  that mention a fellowship or stipend count as financial aid in the example profile). Adjust
+- **OCR:** handwriting and poor scans OCR badly, and text that isn't recognized can't be redacted.
+  Check files the report flags `low_ocr_confidence`.
+- **Names and places:** every detected name and place is redacted, except permitted ones.
+- **Withholding:** the classifier is keyword-based and leans toward withholding too much. Tune
   `classify.py` or `INKWELL_WITHHOLD_THRESHOLD`.
-* Pseudonymized links between saved HTML pages and their assets no longer resolve.
+- **Saved web pages:** links between saved HTML pages and their assets break once paths are
+  pseudonymized.
+
+## Releasing
+
+1. Run `uv version X.Y.Z`.
+2. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z]`, then merge to `main`.
+3. Run `scripts/release.sh --dry-run X.Y.Z`, then `scripts/release.sh X.Y.Z`.
+   - The script runs every check, then tags.
+   - The `release` workflow builds, verifies and publishes the release and the image.
