@@ -178,6 +178,22 @@ inclusive, *before* exclusive; flags combine. Creation time is the file's birth 
 (when it was downloaded/copied here, not when the document was written) and exists only on
 macOS/BSD: in Docker/Linux `--created-*` stops with an error rather than matching nothing.
 
+### Selecting folders
+
+`--folders FILE` limits a run to the top-level input folders named in FILE, one per line (blank
+lines and `#` comments ignored; loose top-level files are not in any folder, so they are left out).
+Alone it ignores dates; with date flags both must match. Use it for folders whose file dates don't
+reflect the records' age (e.g. old records scanned or copied recently), typically as a second run
+into the same output:
+
+```zsh
+scripts/run.sh --modified-before 2020-11-06      # by file date
+scripts/run.sh --folders ~/Documents/inkwell-key/old-classes.txt   # plus these folders, any date
+```
+
+Bad lines are reported by line number only, since folder names can contain names; keep the file
+outside the output folder.
+
 ### Dry run
 
 `--dry-run` does everything a real run does (OCR, classification, per-page withholding,
