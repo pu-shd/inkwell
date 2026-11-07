@@ -16,6 +16,7 @@ each release is tagged `vX.Y.Z` and published on the GitHub Releases page.
   places mostly seen as someone's birthplace or address.
 - Math is preserved: LaTeX math regions in text formats and math-font text in PDFs are not
   redacted as names, places or IDs (strong identifiers such as SSNs still are).
+- `--folders FILE` selects top-level input folders from a list; combines with the date flags.
 - Pause, stop and resume: `--pause`, `--resume` and `--stop` control a running inkwell; Ctrl-C
   or `--stop` saves progress and a rerun continues where it stopped. One run per key folder
   (`inkwell.lock`); half-written files from a killed run are removed.

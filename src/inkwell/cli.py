@@ -697,6 +697,33 @@ def _mode_warnings(mode: Mode) -> list[str]:
     return out
 
 
+def read_folder_list(path: Path, input_dir: Path) -> set[str]:
+    """Top-level input folder names, one per line (blank lines and # comments ignored). Bad lines
+    are reported by number only: folder names can contain people's names."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        raise ConfigError(f"--folders file cannot be read: {exc.strerror}") from exc
+    names: set[str] = set()
+    bad: list[int] = []
+    for n, raw in enumerate(lines, 1):
+        name = raw.strip().rstrip("/").strip()
+        if not name or name.startswith("#"):
+            continue
+        target = input_dir / name
+        if "/" in name or name in (".", "..") or not target.is_dir() or target.resolve().parent != input_dir:
+            bad.append(n)
+            continue
+        names.add(name)
+    if bad:
+        raise ConfigError(
+            f"--folders file line(s) {', '.join(map(str, bad))} do not name a top-level input folder"
+        )
+    if not names:
+        raise ConfigError("--folders file lists no folders")
+    return names
+
+
 def _check_mode(cfg: Config, mode: Mode, args: argparse.Namespace, window: Window) -> None:
     """An output folder holds one mode. Switching requires --force over the whole input."""
     f = cfg.output_dir / "_inkwell_mode.json"
@@ -711,11 +738,11 @@ def _check_mode(cfg: Config, mode: Mode, args: argparse.Namespace, window: Windo
     )
     if previous is None or previous == mode.as_dict():
         return
-    if not args.force or args.limit or window.active:
+    if not args.force or args.limit or window.active or args.folders:
         raise ConfigError(
             f"output was produced with {previous}, this run asks for {mode.as_dict()}; mixing modes "
-            "in one folder is refused. Use --force without --limit/date filters to redo everything, "
-            "or choose a different INKWELL_OUTPUT_DIR"
+            "in one folder is refused. Use --force without --limit/--folders/date filters to redo "
+            "everything, or choose a different INKWELL_OUTPUT_DIR"
         )
 
 
@@ -799,6 +826,12 @@ def _parser() -> argparse.ArgumentParser:
     sel.add_argument("--modified-before", metavar="WHEN", help="only files last modified before WHEN")
     sel.add_argument("--created-after", metavar="WHEN", help="only files created at/after WHEN (macOS)")
     sel.add_argument("--created-before", metavar="WHEN", help="only files created before WHEN (macOS)")
+    sel.add_argument(
+        "--folders",
+        metavar="FILE",
+        help="only these top-level input folders, one name per line (# comments allowed); combines "
+        "with the date flags. Keep the file outside the output folder",
+    )
     sel.add_argument("--limit", type=int, default=0, help="process at most N selected files")
     sel.add_argument("--force", action="store_true", help="reprocess files already scrubbed")
     beh = ap.add_argument_group("behavior (each one alone is weaker; the run warns about its output)")
@@ -1041,17 +1074,34 @@ def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
             if cfg.permitted_places_file
             else ([], [])
         )
+        folders: set[str] | None = None
+        if args.folders:
+            fpath = Path(args.folders).expanduser().resolve()
+            if fpath == cfg.output_dir or cfg.output_dir in fpath.parents:
+                raise ConfigError("--folders file must be outside the output folder (it lists folder names)")
+            folders = read_folder_list(fpath, cfg.input_dir)
         all_jobs = plan(cfg, pmap)
-        jobs = [j for j in all_jobs if window.matches(j)]
+        in_folders = [
+            j
+            for j in all_jobs
+            if folders is None
+            or (len(PurePosixPath(j.rel).parts) > 1 and PurePosixPath(j.rel).parts[0] in folders)
+        ]
+        jobs = [j for j in in_folders if window.matches(j)]
         if not (args.dry_run or args.plan_only or args.suggest_permitted):
             _check_mode(cfg, mode, args, window)
     except (ConfigError, ValueError) as exc:
         log.error("configuration error: %s", exc)
         return 1
 
-    excluded = len(all_jobs) - len(jobs)
+    excluded_by_folders = len(all_jobs) - len(in_folders)
+    excluded = len(in_folders) - len(jobs)
+    if folders is not None:
+        log.info(
+            "folder list selects %d of %d files (%d folders)", len(in_folders), len(all_jobs), len(folders)
+        )
     if window.active:
-        log.info("date window selects %d of %d files (%d excluded)", len(jobs), len(all_jobs), excluded)
+        log.info("date window selects %d of %d files (%d excluded)", len(jobs), len(in_folders), excluded)
     if args.limit:
         jobs = jobs[: args.limit]
     if not jobs:
@@ -1218,6 +1268,7 @@ def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
     summary = {
         "mode": {**mode.as_dict(), "dry_run": mode.dry_run},
         "planned": len(all_jobs),
+        "excluded_by_folders": excluded_by_folders,
         "excluded_by_window": excluded,
         "selected": len(jobs),
         "processed": len(todo),
