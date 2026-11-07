@@ -1,6 +1,6 @@
 [project]
 name = "inkwell"
-version = "0.1.0"
+version = "0.2.0"
 description = "Presidio-based scrubber for sensitive records (PDF, images, email, Office, HTML, zip)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
