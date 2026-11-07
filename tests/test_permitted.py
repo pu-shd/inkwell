@@ -138,6 +138,44 @@ def test_record_subject_always_wins(scrubber: Scrubber, tmp_path: Path) -> None:
         scrubber.set_permitted(PermittedNames([]))
 
 
+def test_shared_word_with_a_record_subject_is_a_conflict(
+    scrubber: Scrubber, ctx: Ctx, tmp_path: Path
+) -> None:
+    # "Quintavius Babbage" is not a registry person, but "Quintavius" is a record subject's name: the
+    # leak check would rightly block any output showing it, so the entry can't be permitted.
+    shared = "Quintavius Babbage"
+    people = load_permitted(
+        _write(tmp_path / "p.csv", f"{shared},,,\nCharles Babbage,{shared},,\n{ADA},,,\n")
+    )
+    kept, conflicts = PermittedNames.without_students(people, scrubber.known)
+    assert [p.name for p in conflicts] == [shared, "Charles Babbage"], "aliases count too"
+    assert [p.name for p in kept] == [ADA]
+    scrubber.set_permitted(PermittedNames(kept))
+    try:
+        m = EmailMessage()
+        m["From"] = f"{shared} <qb@example.org>"
+        m["To"] = f"{ADA} <ada@example.org>"
+        m["Subject"] = "Hello"
+        m.set_content(f"{shared} wrote to {ADA}.")
+        out = process("m.eml", m.as_bytes(), ctx)
+        assert out.status == "redacted" and out.data
+        text = extract_text("m.eml", out.data)
+        assert "Quintavius" not in text and ADA in text
+        from inkwell.leakcheck import find_leaks
+
+        assert find_leaks("m.eml", out.data, scrubber.known) == [], "no leak block"
+    finally:
+        scrubber.set_permitted(PermittedNames([]))
+
+
+def test_place_sharing_a_record_subjects_name_is_dropped(scrubber: Scrubber, tmp_path: Path) -> None:
+    from inkwell.permitted import PermittedPlace
+
+    places = [PermittedPlace("Fernhollow Hall"), PermittedPlace("Springfield")]
+    kept, conflicts = PermittedNames.places_without_students(places, scrubber.known)
+    assert [p.place for p in conflicts] == ["Fernhollow Hall"] and [p.place for p in kept] == ["Springfield"]
+
+
 def test_contacts_redacted_unless_enabled(scrubber: Scrubber, permitted_file: Path) -> None:
     text = f"{ADA} (ada@example.org, (609) 555-0100); other: bob@example.org"
     people = load_permitted(permitted_file)

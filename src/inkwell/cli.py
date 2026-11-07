@@ -43,6 +43,7 @@ from .permitted import (
     write_people,
 )
 from .pseudonym import PseudonymMap
+from .recognizers import KnownNameRecognizer
 from .registry import Registry
 
 if TYPE_CHECKING:
@@ -1033,7 +1034,13 @@ def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
             return audit(cfg, registry)
         students = student_table(cfg, registry)
         permitted, conflicts = _load_permitted(cfg, students)
-        places = load_places(cfg.permitted_places_file) if cfg.permitted_places_file else []
+        places, place_conflicts = (
+            PermittedNames.places_without_students(
+                load_places(cfg.permitted_places_file), KnownNameRecognizer(students)
+            )
+            if cfg.permitted_places_file
+            else ([], [])
+        )
         all_jobs = plan(cfg, pmap)
         jobs = [j for j in all_jobs if window.matches(j)]
         if not (args.dry_run or args.plan_only or args.suggest_permitted):
@@ -1054,18 +1061,30 @@ def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
     for wtext in warnings:
         log.warning("%s", wtext.replace("\n", " "))
 
-    if conflicts:
-        log.warning(
-            "%d permitted name(s) are also registry people and will stay redacted%s",
-            len(conflicts),
-            "" if args.dry_run or args.plan_only else "; listed in permitted-conflicts.csv beside the key",
-        )
+    for what, items, fname in (
+        ("name", conflicts, "permitted-conflicts.csv"),
+        ("place", place_conflicts, "permitted-place-conflicts.csv"),
+    ):
+        if items:
+            log.warning(
+                "%d permitted %s(s) are or contain a registry person's name and will stay redacted%s",
+                len(items),
+                what,
+                "" if args.dry_run or args.plan_only else f"; listed in {fname} beside the key",
+            )
     if not (args.dry_run or args.plan_only or args.suggest_permitted):
         cfile = cfg.key_file.parent / "permitted-conflicts.csv"
         if conflicts:
             write_people(cfile, ([p.name, ";".join(p.aliases), "", ""] for p in conflicts))
         else:
             cfile.unlink(missing_ok=True)
+        pfile = cfg.key_file.parent / "permitted-place-conflicts.csv"
+        if place_conflicts:
+            write_people(
+                pfile, ([p.place, ";".join(p.aliases)] for p in place_conflicts), columns=PLACE_COLUMNS
+            )
+        else:
+            pfile.unlink(missing_ok=True)
 
     if args.suggest_permitted:
         return suggest_permitted(cfg, students, jobs, args.min_students, args.min_place_share)
@@ -1207,6 +1226,7 @@ def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
         "entities": dict(entities),
         "permitted_names": len(permitted),
         "permitted_conflicts": len(conflicts),
+        "permitted_place_conflicts": len(place_conflicts),
         "permitted_places": len(places),
     }
     if args.dry_run:

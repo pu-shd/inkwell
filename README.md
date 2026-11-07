@@ -121,9 +121,11 @@ Ada Lovelace,"Augusta Ada King;A. Lovelace",ada@example.org,(555) 555-0100
 
 * Full names only, matched in either order and ignoring case and titles (`Dr. Ada Lovelace`,
   `Lovelace, Ada`). A lone surname or first name stays redacted.
-* Record subjects always win: an entry that is also a registry person is dropped at startup
-  (counted as `permitted_conflicts` in the summary, listed in `permitted-conflicts.csv` beside the
-  key), and any span overlapping a known subject stays redacted.
+* Record subjects always win: an entry that is a registry person, or contains one of a registry
+  person's name words (a shared first or last name), is dropped at startup (counted as
+  `permitted_conflicts` in the summary, listed in `permitted-conflicts.csv` beside the key), and
+  any span overlapping a known subject stays redacted. Otherwise the leak check would block every
+  output that shows it.
 * Only names are kept. With `INKWELL_PERMITTED_CONTACTS=true`, the listed emails and phone
   numbers of permitted people are kept too; nothing else is.
 * Kept names are counted as `PERMITTED_NAME` (and `PERMITTED_CONTACT`) in the report.
@@ -154,7 +156,8 @@ Wexford Hall,
   street addresses and postal codes always stay redacted.
 * Only `LOCATION` results are unmasked. A place in a labeled field (place of birth, home or
   campus address), a street-address match, or a span overlapping a record subject's name stays
-  redacted. Counted as `PERMITTED_PLACE`; the summary has `permitted_places`.
+  redacted. A place containing a registry person's name word is dropped at startup
+  (`permitted_place_conflicts`, listed in `permitted-place-conflicts.csv`). Counted as `PERMITTED_PLACE`; the summary has `permitted_places`.
 * Trade-off: a permitted town is also visible where it is part of someone's own address outside
   a labeled field.
 * `--suggest-permitted` also writes `permitted-places-suggestions-<time>.csv`. Recurrence alone
@@ -223,6 +226,23 @@ Exit codes: `0` ok · `1` config error · `2` some files errored/leak-blocked (s
 3. `scripts/release.sh X.Y.Z` does the same, then pushes tag `vX.Y.Z`. The `release` workflow
    tests, builds, checks the distributions (`scripts/check_dist.py` allows only listed files),
    installs the wheel into a clean environment, and publishes the GitHub release and image.
+
+### Math
+
+Math is not a redaction target: names and places "found" in formulas are variables and operators.
+
+* Text formats (email, HTML, Office, text): LaTeX math regions (`$…$`, `$$…$$`, `\(…\)`,
+  `\[…\]`, `equation`/`align`-style environments) are left as they are. A region must contain a
+  TeX command (`\frac`, `\alpha`…) or be a tiny `$x$`: operators alone don't count, because scripts
+  and templates in saved pages put `$`, braces and `=` around whole sentences. Inline `$…$` follows
+  the TeX-in-text rule (no space just inside the delimiters, no digit right after the closing `$`;
+  it may wrap a line but not cross a blank line), so dollar amounts are not math. A region with two
+  adjacent capitalized words (`\text{Jane Roe}`) or five ordinary words in a row is prose.
+* PDFs with a text layer: words typeset in math fonts (Computer Modern/AMS/Euler math, OpenType
+  math fonts…) stay visible, and are left out of the invisible text layer. A detection that spans
+  math and ordinary words still boxes the ordinary words.
+* SSNs, email addresses and card numbers are redacted even inside math. Scanned pages have no
+  fonts, so formulas there are treated like any other text.
 
 ## Limits — human review still required
 
