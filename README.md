@@ -273,6 +273,32 @@ without one stops the run before anything is written.
 email, source record key, dropped phone or street, or record subject's name blocks that database;
 the summary names the table, column, row and reason.
 
+## Rebuilding an Access database
+
+The scrubbed SQLite can be turned back into an `.accdb` with the original's tables, fields,
+indexes, relationships, queries, forms, reports and VBA. Microsoft Access does the work in a
+throwaway Windows VM driven from the Mac with [autowin](https://github.com/pubino/autowin); the
+original database only ever enters a disposable clone.
+
+1. **Extract** (`access/guest/extract.ps1`, in the VM): a copy of the original is opened with DAO
+   (no startup code runs) and its structure written to `schema.json`; queries, forms, reports,
+   macros and modules are exported with `SaveAsText`. The export goes to the key folder.
+2. **Sanitize and audit** (`inkwell.accessobjects`, on the Mac): saved filters (which held a
+   surname and an SSN), printer names, SSN input masks, checksums and properties an `.accdb`
+   rejects are removed; each file keeps its encoding. The audit then fails on any record
+   subject's name, record key, SSN pattern, bare 9-digit number, email or phone number, except
+   for name words a person reviewed (`allowed_words`, each with a count).
+3. **Package** (`inkwell.accessbuild`): original tables minus Access-internal ones; removed
+   columns kept and empty; `SSN` holds the record ID; the people table gains `StudentID`; text
+   fields widen where scrubbing lengthened values; VBA references are mapped to current
+   libraries (DAO, ADO). It refuses an export without a clean audit.
+4. **Build** (`access/guest/build.ps1`, in the VM): tables, rows (SQL inserts, checked counts),
+   relationships, then `LoadFromText` of every object, references, compile, database
+   properties, Compact & Repair. `<name>.accdb.json` reports counts and every import error.
+5. **Verify** (on the Mac): mdbtools reads the result; row counts, record IDs, `StudentID` and
+   empty removed columns are compared with the scrubbed SQLite, and the file's bytes are
+   searched for every registry full name, source record key, email and phone number.
+
 ## Settings
 
 All settings are `INKWELL_*` environment variables. `example.env` lists every one with a short
