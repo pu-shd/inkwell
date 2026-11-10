@@ -931,6 +931,11 @@ def _parser() -> argparse.ArgumentParser:
         help="do everything but write: no output, no registry or key changes; record matches go to "
         "db-dryrun-<time>.csv in the key folder",
     )
+    p.add_argument(
+        "--accept-settings",
+        action="store_true",
+        help="accept settings that differ from the key folder's settings.json (the old record is kept)",
+    )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
@@ -950,6 +955,13 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         lock = cfg.key_file.parent / LOCK_NAME
         _acquire_lock(lock)
+        if args.accept_settings and args.dry_run:
+            raise ConfigError("--accept-settings applies to a real run")
+        from . import settings
+
+        # The same record as the document runs: one key folder, one set of settings.
+        mode: settings.Mode = "warn" if args.dry_run else "record"
+        settings.check(cfg, tool="inkwell-db", mode=mode, accept=args.accept_settings)
         dbs = [Database(p, output_stem(p), open_source(p)) for p in paths]
         return run(cfg, dbs, dry_run=args.dry_run)
     except (ConfigError, MdbError) as exc:

@@ -770,6 +770,16 @@ def _parser() -> argparse.ArgumentParser:
         help="do everything but write only a report of what each file would get",
     )
     run.add_argument(
+        "--save-settings",
+        action="store_true",
+        help="record the settings that shape this key folder (settings.json in the key folder) and exit",
+    )
+    run.add_argument(
+        "--accept-settings",
+        action="store_true",
+        help="accept settings that differ from the key folder's settings.json (the old record is kept)",
+    )
+    run.add_argument(
         "--report",
         metavar="PATH",
         help="dry-run report path (default: the key folder); must be outside input and output",
@@ -1004,7 +1014,16 @@ def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
         if sum(map(bool, (args.dry_run, args.plan_only, args.audit, args.suggest_permitted))) > 1:
             raise ConfigError("choose one of --dry-run, --plan-only, --audit, --suggest-permitted")
         controls = [a for a in ("pause", "resume", "stop") if getattr(args, a)]
-        modes = (args.dry_run, args.plan_only, args.audit, args.suggest_permitted, args.force, args.limit)
+        modes = (
+            args.dry_run,
+            args.plan_only,
+            args.audit,
+            args.suggest_permitted,
+            args.force,
+            args.limit,
+            args.save_settings,
+            args.accept_settings,
+        )
         if len(controls) > 1 or (controls and any(modes)):
             raise ConfigError("--pause, --resume and --stop are used alone, against a running inkwell")
         if args.min_students < 2:
@@ -1013,6 +1032,10 @@ def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
             raise ConfigError("--min-place-share must be between 1 and 100")
         if args.report and not args.dry_run:
             raise ConfigError("--report applies to --dry-run")
+        if args.save_settings and any((args.dry_run, args.plan_only, args.audit, args.suggest_permitted)):
+            raise ConfigError("--save-settings is used alone")
+        if args.accept_settings and any((args.dry_run, args.plan_only, args.audit, args.suggest_permitted)):
+            raise ConfigError("--accept-settings applies to a real run or --save-settings")
         window = Window(
             *(
                 parse_when(v) if v else None
@@ -1045,6 +1068,18 @@ def _main(argv: list[str] | None, stack: contextlib.ExitStack) -> int:
                 raise ConfigError("--report file already exists")
         if not args.plan_only:
             _preflight(cfg)
+        from . import settings
+
+        if args.save_settings:
+            settings.check(cfg, tool="inkwell", mode="record", accept=args.accept_settings)
+            return 0
+        real_run = not (args.dry_run or args.plan_only or args.audit or args.suggest_permitted)
+        settings.check(
+            cfg,
+            tool="inkwell",
+            mode="record" if real_run else "strict" if args.audit else "warn",
+            accept=args.accept_settings,
+        )
         from .recognizers import configure_name_noise
 
         configure_name_noise(cfg.extra_name_noise)

@@ -88,6 +88,14 @@ folders; it has mode 700 and its files mode 600.
 |---|---|
 | `registry.csv` | One row per person: ID, name, aliases, class years, folders, institution ID, `needs_review` |
 | `key.csv` | One row per file, folder or attachment: original path, pseudonym path, owners, names mentioned, input and output SHA-256 |
+| `settings.json` | The settings that shaped the key: noise words, ID labels, year-folder pattern, detection types and thresholds, and the permitted files (name and SHA-256) |
+
+**Settings travel with the key:**
+- A real run records `settings.json` and refuses to run with different settings, naming each one.
+- `--accept-settings` records the new settings and keeps the old record as `settings-<time>.json`.
+- A dry run only warns; `--audit` always refuses.
+- `--save-settings` records the current settings and exits.
+- Paths, workers and DPI are not recorded. A permitted file may move; editing it counts as a change.
 
 **Re-identifying a document:**
 1. Find the person in `registry.csv`.
