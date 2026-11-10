@@ -31,10 +31,11 @@ ENTRYPOINT ["inkwell"]
 # ---------------------------------------------------------------------------
 FROM base AS test
 USER root
+RUN apt-get update && apt-get install -y --no-install-recommends zsh && rm -rf /var/lib/apt/lists/*
 RUN uv sync --frozen
 COPY tests ./tests
 COPY CHANGELOG.md ./
-COPY scripts/check_dist.py ./scripts/
+COPY scripts ./scripts
 USER scrub
 ENV RUFF_CACHE_DIR=/tmp/ruff-cache MYPY_CACHE_DIR=/tmp/mypy-cache
 ENTRYPOINT []
