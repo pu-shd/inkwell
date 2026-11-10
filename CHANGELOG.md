@@ -5,6 +5,14 @@ each release is tagged `vX.Y.Z` and published on the GitHub Releases page.
 
 ## [Unreleased]
 
+### Added
+- `inkwell-db` scrubs Microsoft Access databases (`.mdb`, `.accdb`, read with mdbtools) into SQLite
+  and CSV with the same registry and IDs as the documents. Every column has a declared treatment
+  (key, drop, withhold, keep, code, faculty, text); an unknown column stops the run. People found
+  only in a database are added to the registry for review; `db-key.csv` links source records to
+  `R-` record IDs. Outputs are re-read and leak-checked before they are published.
+- `scripts/run-db.sh` and `scripts/docker-run-db.sh`; the container image includes mdbtools.
+
 ## [0.2.0] - 2026-11-06
 
 ### Added

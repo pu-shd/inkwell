@@ -462,6 +462,18 @@ class KnownNameRecognizer(EntityRecognizer):
                 out.append(RecognizerResult(self._entity, m.start(), m.end(), score))
         return out
 
+    def matches(self, text: str) -> list[tuple[int, int, bool]]:
+        """Every match as (start, end, is_full_name); full names and single words may overlap."""
+        out: list[tuple[int, int, bool]] = []
+        for rx, full in ((self._phrase_rx, True), (self._token_rx, False)):
+            if rx is not None:
+                out.extend((m.start(), m.end(), full) for m in rx.finditer(text))
+        return out
+
+    def find_full_name(self, text: str) -> bool:
+        """A full-name match only (no single name words)."""
+        return self._phrase_rx is not None and self._phrase_rx.search(text) is not None
+
     def find_any(self, text: str) -> bool:
         """Used by the leak check."""
         return any(rx is not None and rx.search(text) for rx in (self._phrase_rx, self._token_rx))

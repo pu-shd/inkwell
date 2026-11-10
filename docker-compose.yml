@@ -27,3 +27,20 @@ services:
       - ${HOST_INPUT_DIR:-./.unset-input}:/data/input:ro
       - ${HOST_OUTPUT_DIR:-./.unset-output}:/data/output
       - ${HOST_KEY_DIR:-./.unset-key}:/data/key
+
+  scrub-db:
+    build:
+      context: .
+      target: base
+    image: inkwell:latest
+    network_mode: none
+    entrypoint: ["inkwell-db"]
+    environment:
+      INKWELL_DB_INPUT_DIR: /data/input
+      INKWELL_DB_OUTPUT_DIR: /data/output
+      INKWELL_KEY_FILE: /data/key/key.csv
+    # scripts/docker-run-db.sh exports these from .env and maps the permitted-names files.
+    volumes:
+      - ${INKWELL_DB_INPUT_DIR:-./.unset-input}:/data/input:ro
+      - ${INKWELL_DB_OUTPUT_DIR:-./.unset-output}:/data/output
+      - ${HOST_KEY_DIR:-./.unset-key}:/data/key

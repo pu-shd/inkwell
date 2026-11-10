@@ -127,6 +127,14 @@ class Registry:
             s.class_years.add(year)
         return s
 
+    def add_person(self, name: str, aliases: set[str] | None = None, note: str = "") -> Student:
+        """A new person with no document folder (e.g. found only in a database)."""
+        sid = new_id("student", self.students)
+        display = re.sub(r"\s+", " ", name).strip()
+        s = Student(sid, display, {a for a in (aliases or set()) if a and a != display}, needs_review=note)
+        self.students[sid] = s
+        return s
+
     def build(self, input_dir: Path) -> None:
         for cls in sorted(input_dir.iterdir()):
             if cls.is_dir() and self.is_group_dir(cls.name):

@@ -14,8 +14,8 @@ ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford: no I, L, O, U
 # Check character: position-weighted sum mod 31 (prime), drawn from the same alphabet so IDs are
 # safe in filenames and shells. Catches single-character typos except 0<->Z swaps.
 
-PREFIXES = {"student": "S", "doc": "D", "dir": "F"}
-BODY_LEN = {"S": 8, "D": 10, "F": 6}
+PREFIXES = {"student": "S", "doc": "D", "dir": "F", "record": "R"}
+BODY_LEN = {"S": 8, "D": 10, "F": 6, "R": 8}
 
 
 def _check_char(body: str) -> str:
@@ -33,7 +33,7 @@ def new_id(kind: str, taken: Container[str] = ()) -> str:
 
 
 def is_valid(ident: str) -> bool:
-    m = re.fullmatch(r"([SDF])-([0-9A-HJKMNP-TV-Z]+)([0-9A-HJKMNP-TV-Z])", ident)
+    m = re.fullmatch(r"([SDFR])-([0-9A-HJKMNP-TV-Z]+)([0-9A-HJKMNP-TV-Z])", ident)
     if not m or len(m.group(2)) != BODY_LEN[m.group(1)]:
         return False
     return _check_char(m.group(2)) == m.group(3)

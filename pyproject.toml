@@ -27,6 +27,7 @@ Changelog = "https://github.com/pu-shd/inkwell/blob/main/CHANGELOG.md"
 
 [project.scripts]
 inkwell = "inkwell.cli:main"
+inkwell-db = "inkwell.accessdb:main"
 
 [dependency-groups]
 dev = [

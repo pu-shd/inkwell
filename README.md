@@ -15,6 +15,7 @@ scripts/run.sh                    # the real run; re-run to continue or to add n
 ```
 
 Other scripts: `scripts/docker-run.sh` (the same run in a network-isolated container),
+`scripts/run-db.sh` (Access databases, see [Access databases](#access-databases)),
 `scripts/test.sh` (lint, types and tests in Docker; `--local` uses `.venv`).
 
 To install a release instead of using a clone (needs Python 3.12 and Tesseract):
@@ -214,6 +215,55 @@ The next run redoes just those files.
 | `2` | some files errored or were leak-blocked (see the report) |
 | `3` | nothing selected |
 | `130` | stopped |
+
+## Access databases
+
+`inkwell-db` scrubs Microsoft Access files (`.mdb`, `.accdb`) into SQLite and CSV. It uses the same
+key folder, so a person's `S-…` ID in the database is the ID of their folder in the scrubbed
+documents.
+
+```zsh
+brew install mdbtools             # reads Access files (read-only)
+scripts/run-db.sh --dry-run       # writes only db-dryrun-<time>.csv (record matches) to the key folder
+scripts/run-db.sh                 # the real run; safe to re-run
+```
+
+`scripts/docker-run-db.sh` does the same in a network-isolated container. Permitted-names and places
+files must then be inside `HOST_KEY_DIR`.
+
+**Settings:** `INKWELL_DB_INPUT_DIR` (folder of databases, read-only), `INKWELL_DB_OUTPUT_DIR`, and
+the usual `INKWELL_KEY_FILE`, `INKWELL_PERMITTED_*` and tuning settings.
+
+**Output** (per database): `<name>.sqlite`, `<name>/<table>.csv`, and `<name>.schema.json`, which
+lists every source column, its type and what happened to it, so an Access file can be rebuilt later.
+`_inkwell_db_summary.json` holds counts and leak reports, never values.
+
+**Every column has a declared treatment** in `POLICY` (`src/inkwell/accessdb.py`). A table or column
+without one stops the run before anything is written.
+
+| Treatment | Effect |
+|---|---|
+| `key` | The record key becomes `record_id` (`R-…`, one per source record) and `student_id` (`S-…`) |
+| `drop` | Direct identifiers: names, addresses, phones, emails, date of birth, thesis titles |
+| `withhold` | Protected records: grades, test scores, GPAs, funding, ESL results, demographics |
+| `keep` | Copied; record subjects' names and contact or ID patterns are replaced |
+| `code` | Codes, numbers and dates; code-shaped values (`ECO 525`) are copied as they are |
+| `faculty` | Advisors, committees, instructors: copied; a record subject's full name is replaced |
+| `text` | Free text: scrubbed like a document |
+
+**People:**
+- Each person is matched to `registry.csv` by name. A unique full match is `exact`; a unique match on
+  part of the name is `partial` (review these).
+- Anyone else is added to `registry.csv` with a new ID and a `needs_review` note. Later document runs
+  then redact them too.
+- `db-key.csv` (key folder) maps each source record key to its `record_id` and `student_id`. Edit
+  `student_id` there to fix a match; re-runs keep it.
+- Full names in faculty columns are permitted in the free text (`db-faculty.csv`), unless they share
+  a word with a record subject (`db-faculty-conflicts.csv`).
+
+**Fails closed:** the written SQLite and CSV are re-read before they are published. Any SSN pattern,
+email, source record key, dropped phone or street, or record subject's name blocks that database;
+the summary names the table, column, row and reason.
 
 ## Settings
 
