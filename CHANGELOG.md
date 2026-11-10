@@ -5,6 +5,12 @@ each release is tagged `vX.Y.Z` and published on the GitHub Releases page.
 
 ## [Unreleased]
 
+### Added
+- `settings.json` in the key folder records the settings that shape the key (noise words, ID labels,
+  year-folder pattern, detection settings, permitted files by SHA-256). A real run with different
+  settings is refused unless `--accept-settings` (the old record is kept); dry runs warn and
+  `--audit` refuses. `inkwell --save-settings` records them without a run.
+
 ## [0.2.0] - 2026-11-06
 
 ### Added
