@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -36,8 +37,45 @@ DEFAULT_ENTITIES = (
 DEFAULT_GROUP_DIR_REGEX = r"^(?:.*\D)?(\d{4}-\d{2})$"
 
 
+log = logging.getLogger("inkwell")
+
+
 class ConfigError(ValueError):
     """Raised when configuration is missing or invalid."""
+
+
+def _from_key_folder(env: dict[str, str], key_dir: Path) -> None:
+    """Fill key-shaping variables that are not set at all from the key folder's settings.json,
+    so a key folder carries its own settings to a new machine. A set variable (even empty) wins
+    and is then checked against the record as before."""
+    from . import settings  # settings imports this module
+
+    path = key_dir / settings.SETTINGS_NAME
+    if not path.exists():
+        return
+    recorded = settings.load(path)["settings"]
+    assert isinstance(recorded, dict)
+    taken = []
+    for name, value in recorded.items():
+        if name in env or not name.startswith("INKWELL_") or value is None:
+            continue
+        if isinstance(value, dict):  # a permitted file, recorded by its path in the key folder
+            file = key_dir / str(value.get("file", ""))
+            if not file.is_file() or not value.get("file"):
+                raise ConfigError(
+                    f"{name} was recorded as {value.get('file')}, which is not in the key folder; "
+                    f"put the file there or set {name}"
+                )
+            env[name] = str(file)
+        elif isinstance(value, bool):
+            env[name] = "true" if value else "false"
+        elif isinstance(value, list):
+            env[name] = ",".join(map(str, value))
+        else:
+            env[name] = str(value)
+        taken.append(name)
+    if taken:
+        log.info("from the key folder's %s: %s", settings.SETTINGS_NAME, ", ".join(sorted(taken)))
 
 
 @dataclass(frozen=True)
@@ -110,6 +148,7 @@ def load_config(env: dict[str, str] | None = None, *, require_output: bool = Tru
         raise ConfigError("INKWELL_OUTPUT_DIR exists and is not a directory")
     if not key_file.parent.is_dir():
         raise ConfigError("directory containing INKWELL_KEY_FILE does not exist")
+    _from_key_folder(env, key_file.parent)
 
     entities: tuple[str, ...] = DEFAULT_ENTITIES
     if env.get("INKWELL_ENTITIES"):
