@@ -94,7 +94,13 @@ folders; it has mode 700 and its files mode 600.
 - `--accept-settings` records the new settings and keeps the old record as `settings-<time>.json`.
 - A dry run only warns; `--audit` always refuses.
 - `--save-settings` records the current settings and exits.
+- A recorded setting that is not set at all is taken from `settings.json`; a permitted file is
+  taken from the key folder. Set a variable (even to empty) to override; the run then checks it.
 - Paths, workers and DPI are not recorded. A permitted file may move; editing it counts as a change.
+
+**New machine.** Restore the key folder (mode 700) from its encrypted backup, then set only the
+paths in `.env`: `INKWELL_INPUT_DIR`, `INKWELL_OUTPUT_DIR` and `INKWELL_KEY_FILE` (and the `HOST_*`
+paths for Docker). Keep permitted files inside the key folder so they travel with it.
 
 **Re-identifying a document:**
 1. Find the person in `registry.csv`.

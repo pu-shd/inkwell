@@ -154,3 +154,69 @@ def test_inkwell_flag_combinations_are_refused(cli_env: dict[str, Path]) -> None
 
 def _record_at(key_dir: Path) -> dict[str, dict[str, object]]:
     return json.loads((key_dir / SETTINGS_NAME).read_text())
+
+
+# --- a key folder carries its settings: unset variables are filled from settings.json ------------
+
+
+def _env(cfg: Config, **extra: str) -> dict[str, str]:
+    cfg.input_dir.mkdir(exist_ok=True)
+    return {
+        "INKWELL_INPUT_DIR": str(cfg.input_dir),
+        "INKWELL_OUTPUT_DIR": str(cfg.output_dir),
+        "INKWELL_KEY_FILE": str(cfg.key_file),
+        **extra,
+    }
+
+
+def test_unset_settings_come_from_the_key_folder(cfg: Config, caplog: pytest.LogCaptureFixture) -> None:
+    from inkwell.config import load_config
+
+    caplog.set_level(logging.INFO)
+    check(cfg, tool="inkwell", mode="record")
+    loaded = load_config(_env(cfg))  # a new machine: .env has only the paths
+    assert loaded.extra_name_noise == ("grad", "mse") and loaded.extra_id_labels == ("PUID",)
+    assert loaded.permitted_names_file == cfg.permitted_names_file.resolve()  # type: ignore[union-attr]
+    assert loaded.permitted_places_file is None
+    assert snapshot(loaded) == snapshot(cfg), "the run matches the record"
+    assert "INKWELL_EXTRA_NAME_NOISE" in caplog.text and "mse" not in caplog.text, "names only, no values"
+
+
+def test_set_settings_win_over_the_record(cfg: Config) -> None:
+    from inkwell.config import load_config
+
+    check(cfg, tool="inkwell", mode="record")
+    loaded = load_config(_env(cfg, INKWELL_EXTRA_NAME_NOISE="phd", INKWELL_PERMITTED_NAMES_FILE=""))
+    assert loaded.extra_name_noise == ("phd",), "a set value is used (and then checked)"
+    assert loaded.permitted_names_file is None, "an empty value means none, not the record"
+    with pytest.raises(ConfigError, match="INKWELL_EXTRA_NAME_NOISE"):
+        check(loaded, tool="inkwell", mode="record")
+
+
+def test_recorded_file_missing_from_the_key_folder_is_refused(cfg: Config) -> None:
+    from inkwell.config import load_config
+
+    check(cfg, tool="inkwell", mode="record")
+    cfg.permitted_names_file.unlink()  # type: ignore[union-attr]
+    with pytest.raises(
+        ConfigError, match="INKWELL_PERMITTED_NAMES_FILE.*permitted.csv.*not in the key folder"
+    ):
+        load_config(_env(cfg))
+
+
+def test_recorded_file_outside_the_key_folder_must_be_set(cfg: Config, tmp_path: Path) -> None:
+    from inkwell.config import load_config
+
+    outside = tmp_path / "elsewhere" / "places.csv"
+    outside.parent.mkdir()
+    outside.write_text("place,aliases\nSpringfield,\n")
+    check(dataclasses.replace(cfg, permitted_places_file=outside), tool="inkwell", mode="record")
+    with pytest.raises(ConfigError, match="INKWELL_PERMITTED_PLACES_FILE.*not in the key folder"):
+        load_config(_env(cfg))
+
+
+def test_no_record_means_defaults(cfg: Config) -> None:
+    from inkwell.config import load_config
+
+    loaded = load_config(_env(cfg))
+    assert loaded.extra_name_noise == () and loaded.permitted_names_file is None

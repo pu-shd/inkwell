@@ -10,6 +10,9 @@ each release is tagged `vX.Y.Z` and published on the GitHub Releases page.
   year-folder pattern, detection settings, permitted files by SHA-256). A real run with different
   settings is refused unless `--accept-settings` (the old record is kept); dry runs warn and
   `--audit` refuses. `inkwell --save-settings` records them without a run.
+- A key folder carries its settings: a recorded setting that is not set at all is taken from
+  `settings.json`, and a recorded permitted file from the key folder. On a new machine `.env` needs
+  only the paths.
 
 ### Fixed
 - `scripts/docker-run.sh` now passes the key-shaping settings from `.env` into the container (name
